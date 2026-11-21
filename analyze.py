@@ -211,6 +211,18 @@ class Map:
 # ---------------------------------------------------------------- AST helpers
 
 
+class _BlankLambdas(ast.NodeTransformer):
+    def visit_Lambda(self, node):
+        self.generic_visit(node)
+        node.body = ast.Constant(value="<lambda body>")
+        return node
+
+
+def lambda_blind_dump(tree):
+    import copy
+    return strip_dump(_BlankLambdas().visit(copy.deepcopy(tree)))
+
+
 def strip_dump(tree):
     return ast.dump(tree, annotate_fields=False, include_attributes=False)
 
@@ -532,6 +544,8 @@ class Analyzer:
             hunks = eff or hunks
         removed, inserted = change_points(hunks)
         new_scopes = Scopes(new_text, path)
+        # every difference sits inside lambda bodies: their callers are all that matter
+        self._lambda_only = lambda_blind_dump(old_scopes.tree) == lambda_blind_dump(new_tree)
         for ln in sorted(removed):
             self._locate(path, old_scopes, new_scopes, ln, None, res, is_test)
         for ln, added in inserted:
@@ -591,6 +605,8 @@ class Analyzer:
             # a lambda in a class/module-level literal: its callers, plus whatever the
             # enclosing statement means at class/module level
             res.add(mp.line_tests(path, func.lineno, func.end_lineno), f"lambda {path}:{line}")
+            if getattr(self, "_lambda_only", False):
+                return
             stmt = None
             for st, en, nd, ch in osc.nodes:
                 if isinstance(nd, ast.stmt) and st <= line <= en and (stmt is None or (en - st) < (stmt[1] - stmt[0])):
@@ -683,7 +699,9 @@ class Analyzer:
         users = set(users) | self.name_users(classes[-1].name) & self._loaded(path)
         if isinstance(node, ast.ClassDef):
             # class header (bases, keywords): everything using it
-            return users | mp.file_tests(path) if not users else users
+            # nobody instantiates it or names it at run time (e.g. typing-only classes):
+            # only an import failure could matter, and the import check covers that
+            return users
         targets = _targets(node)
         refined = None
         if targets:

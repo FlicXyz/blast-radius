@@ -216,7 +216,16 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
     list_cost = split.best_split([(ms[x], x) for x in cands])[0] / 1000
     run_cost = sum(ms[x] for x in cheap) / 1000 + 0.2 + sum(
         SETUP_COST.get(c, 0) for c in {"::".join(mp_id(mp, to_num, x).split("::")[:2]) for x in cheap})
-    if not ok:
+    # A real edit to a fixture almost always breaks the test reading it, so running it
+    # first only adds CPU: list such tests straight away.
+    data_only = files and all(
+        (fd["new"] or fd["old"] or "").startswith("tests/") and not (fd["new"] or fd["old"]).endswith(".py")
+        for fd in files)
+    if data_only and not all(_comment_only_fixture(fd) for fd in files):
+        p["run"] = []
+        p["final_static"] = set(cands)
+        p["note"] += " fixture-list"
+    elif not ok:
         p["run"] = []
         p["final_static"] = set(cands)
         p["note"] += " unappliable"
@@ -236,6 +245,14 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
         covered_by_cheap = proxy_ok(res, to_num, ms)
     p["proxy_ok"] = covered_by_cheap
     return p
+
+
+def _comment_only_fixture(fd):
+    for _, body in fd["hunks"]:
+        for tag, txt in body:
+            if tag in "+-" and txt.strip() and not txt.strip().startswith("--"):
+                return False
+    return True
 
 
 _id_of = {}
