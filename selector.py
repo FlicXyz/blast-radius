@@ -34,7 +34,7 @@ EXPENSIVE = 2.0      # seconds: tests above this are not run, only reasoned abou
 PARALLEL = 2
 # With slow candidates in play, keep running after a failure: changes that break
 # the slow tests break many cheap ones too, so a handful of failures decides it.
-STOP_AFTER_EXP = 3
+STOP_AFTER_EXP = 1
 # CPU seconds of class-level fixtures (setUpClass) at the pinned commit; the
 # recorded per-test seconds don't include them.
 SETUP_COST = {"tests/test_executor.py::TestExecutor": 1.3}
@@ -255,8 +255,19 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
         p["final_static"] = set(cands)
         p["note"] += f" list-only(run {run_cost:.1f} > list {list_cost:.1f})"
     else:
-        p["run"] = cheap
-        p["final_static"] = set()
+        # in a mixed commit, the tests reading an edited fixture are listed as above;
+        # only the code side is run
+        fixture_static = set()
+        for fd in files:
+            rel = fd["new"] or fd["old"] or ""
+            if rel.startswith("tests/") and not rel.endswith(".py") and not _comment_only_fixture(fd):
+                for why, s in res.locs:
+                    if why == f"data {rel}":
+                        fixture_static |= {to_num[i] for i in s if to_num[i] is not None}
+        p["run"] = [x for x in cheap if x not in fixture_static]
+        p["final_static"] = fixture_static & cands
+        if fixture_static:
+            p["note"] += f" fixture-static({len(fixture_static)})"
     p["expensive"] = expensive
     p["run_ids"] = [mp_id(mp, to_num, x) for x in p["run"]]
     # classmates of each slow test among the cheap ones we run: if they all pass, the
@@ -394,6 +405,9 @@ def handle(p, msg):
         p["tcpu"] = p.get("tcpu", 0) + msg.get("cpu", 0)
         if DEBUG:
             p.setdefault("tlist", []).append((msg.get("cpu", 0), msg["id"]))
+            if not msg["ok"] and msg.get("err") and p.get("_errs", 0) < 3:
+                p["_errs"] = p.get("_errs", 0) + 1
+                log("   ERR", msg["id"], msg["err"][:300])
     elif k == "import":
         p["imports_ok"][msg["module"]] = msg["ok"]
         if not msg["ok"]:
