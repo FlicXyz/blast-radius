@@ -105,7 +105,57 @@ class _StopRun(BaseException):
     pass
 
 
-STATE = {"failures": 0, "stop_after": 1}
+STATE = {"failures": 0, "stop_after": 1, "lazy": False}
+
+# Class fixtures that only build data a few tests read: built on first use instead.
+# Applies only when nothing the fixture runs is patched (the selector checks), so it
+# behaves exactly as in the pinned tree, just later or never.
+LAZY_SETUP = {("tests/test_executor.py", "TestExecutor")}
+
+
+def _lazy_class_setup(cls):
+    import inspect
+    import re
+    orig_setup = cls.__dict__.get("setUpClass")
+    orig_tear = cls.__dict__.get("tearDownClass")
+    if not isinstance(orig_setup, classmethod):
+        return
+    names = set(re.findall(r"\bcls\.(\w+)\s*=", inspect.getsource(orig_setup.__func__)))
+    if not names:
+        return
+    state = {"loaded": False}
+
+    class Lazy:
+        def __init__(self, name):
+            self.name = name
+
+        def __get__(self, obj, owner):
+            load()
+            return getattr(cls, self.name)
+
+    def load():
+        if state["loaded"]:
+            return
+        state["loaded"] = True
+        for n in names:
+            if isinstance(cls.__dict__.get(n), Lazy):
+                delattr(cls, n)
+        orig_setup.__func__(cls)
+
+    def setUpClass(c):
+        state["loaded"] = False
+        for n in names:
+            setattr(cls, n, Lazy(n))
+
+    def tearDownClass(c):
+        if state["loaded"] and isinstance(orig_tear, classmethod):
+            orig_tear.__func__(cls)
+        for n in names:
+            if isinstance(cls.__dict__.get(n), Lazy):
+                delattr(cls, n)
+
+    cls.setUpClass = classmethod(setUpClass)
+    cls.tearDownClass = classmethod(tearDownClass)
 
 
 def _alarm(signum, frame):
@@ -118,8 +168,9 @@ def _purge():
             del sys.modules[name]
 
 
-def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, stop_after=1):
+def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, stop_after=1, lazy=False):
     STATE["stop_after"] = stop_after
+    STATE["lazy"] = lazy
     """plan: list of (test_id, timeout_s). Writes JSON lines to wfd."""
     global SRC
     SRC = src
@@ -207,7 +258,25 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, st
             signal.setitimer(signal.ITIMER_REAL, 0)
             emit(kind="import", module=m, ok=False, err=repr(e)[:300])
 
-    # group by test module and class, keeping order
+    must = {e[0] for e in plan if len(e) > 2 and e[2]}
+    done_ids = set()
+    stopped = _run_groups([(e[0], e[1]) for e in plan], emit, done_ids)
+    if stopped:
+        emit(kind="stopped")
+        # sentinels: classmates of slow tests, whose results decide whether the slow
+        # tests are listed. They run to the end whatever else failed.
+        rest = [(e[0], e[1]) for e in plan if e[0] in must and e[0] not in done_ids]
+        if rest:
+            STATE["stop_after"] = 10 ** 9
+            _run_groups(rest, emit, done_ids)
+    emit(kind="done")
+    out.close()
+    os._exit(0)
+
+
+def _run_groups(plan, emit, done_ids):
+    """Runs (test_id, timeout) pairs grouped by class; returns True if stopped early."""
+    import unittest
     groups = {}
     for tid, to in plan:
         path, cls, meth = tid.split("::")
@@ -233,6 +302,7 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, st
             super().stopTest(test)
             tid = self._id(test)
             if tid:
+                done_ids.add(tid)
                 emit(kind="test", id=tid, ok=tid not in self.failed,
                      cpu=round(time.process_time() - getattr(test, "_br_t0", time.process_time()), 3))
                 if tid in self.failed:
@@ -276,9 +346,13 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, st
             mod = importlib.import_module(modname)
             signal.setitimer(signal.ITIMER_REAL, 0)
             cls = getattr(mod, clsname)
+            if STATE["lazy"] and (path, clsname) in LAZY_SETUP and not getattr(cls, "_br_lazy", False):
+                _lazy_class_setup(cls)
+                cls._br_lazy = True
         except BaseException as e:  # noqa
             signal.setitimer(signal.ITIMER_REAL, 0)
             for meth, to, tid in items:
+                done_ids.add(tid)
                 emit(kind="test", id=tid, ok=False, err="import: " + repr(e)[:200])
             continue
         tests = []
@@ -286,6 +360,7 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, st
             try:
                 t = cls(meth)
             except BaseException as e:  # noqa
+                done_ids.add(tid)
                 emit(kind="test", id=tid, ok=False, err="init: " + repr(e)[:200])
                 continue
             t._br_id = tid
@@ -303,28 +378,26 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, st
             emit(kind="group_error", err=repr(e)[:200])
         if res.fixture_failed:
             emit(kind="group_failed", tests=[tid for _, _, tid in items])
+            done_ids.update(tid for _, _, tid in items)
             stop = True
         if stop:
-            emit(kind="stopped")
-            break
+            return True
         # class cleanups/teardown of the module
         try:
             unittest.suite._call_if_exists(res, "_restoreStdout")
         except Exception:
             pass
-    emit(kind="done")
-    out.close()
-    os._exit(0)
+    return False
 
 
-def start(src, patched_files, deleted, plan, import_checks, purge=True, stop_after=1):
+def start(src, patched_files, deleted, plan, import_checks, purge=True, stop_after=1, lazy=False):
     """Forks a child running plan; returns (pid, read file)."""
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:
         os.close(r)
         try:
-            _child(src, patched_files, deleted, plan, w, import_checks, purge, stop_after)
+            _child(src, patched_files, deleted, plan, w, import_checks, purge, stop_after, lazy)
         except BaseException:  # noqa
             traceback.print_exc()
         os._exit(1)

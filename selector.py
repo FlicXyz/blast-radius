@@ -28,6 +28,8 @@ SRC = os.environ.get("BR_SRC", "/app/sqlglot")
 MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.json.gz"))
 TMP = os.environ.get("BR_TMP", "/tmp/br")
 
+DEBUG = os.environ.get("BR_DEBUG")
+SENTINEL_RATIO = 0.5  # run a slow test's classmates to the end when they cost under this share of it
 EXPENSIVE = 2.0      # seconds: tests above this are not run, only reasoned about
 PARALLEL = 2
 # With slow candidates in play, keep running after a failure: changes that break
@@ -142,11 +144,32 @@ def _main():
         print(json.dumps({"commit": cid, "workers": workers}), flush=True)
         PRINTED.add(cid)
         log(f"{cid}: cand={len(p.get('cands', ()))} ran={len(p.get('run', ()))} failed={len(p.get('failed', ()))} "
-            f"final={len(final)} cost={cost/1000:.1f}s cpu={p.get('cpu', 0):.2f} {p.get('note', '')}")
+            f"final={len(final)} cost={cost/1000:.1f}s cpu={p.get('cpu', 0):.2f} tcpu={p.get('tcpu', 0):.2f} purge={p.get('purge')} {p.get('note', '')}")
+        if DEBUG and p.get("tlist"):
+            rec = sum(ms.get(n, 0) for n in p.get("run", ())) / 1000
+            log(f"   recorded={rec:.2f} top: " + "; ".join(f"{c:.2f} {t}" for c, t in sorted(p["tlist"], reverse=True)[:6]))
     log(f"total wall {time.time() - t0:.1f}s")
 
 
 _heavy_cache = {}
+
+
+LAZY_DEPS = ("sqlglot/executor/table.py", "tests/helpers.py", "tests/test_executor.py",
+             "tests/fixtures/optimizer/tpc-h/", "tests/fixtures/optimizer/tpc-ds/")
+
+
+def setup_cost(c, p):
+    if lazy_ok(p) and tuple(c.split("::")) in LAZY_CLASSES:
+        return 0.0
+    return SETUP_COST.get(c, 0)
+
+
+LAZY_CLASSES = {("tests/test_executor.py", "TestExecutor")}
+
+
+def lazy_ok(p):
+    """TestExecutor's fixture can be built lazily when nothing it runs is patched."""
+    return not any(rel.startswith(d) for rel in list(p.get("patched", ())) + list(p.get("deleted", ())) for d in LAZY_DEPS)
 
 
 def needs_heavy(src, rel):
@@ -207,13 +230,13 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
     def order(x):
         tid = mp_id(mp, to_num, x)
         tf = os.path.basename(tid.split("::")[0])[5:-3]
-        setup = SETUP_COST.get("::".join(tid.split("::")[:2]), 0)
+        setup = setup_cost("::".join(tid.split("::")[:2]), p)
         return (setup > 0.5, -(tf in stems), -hits.get(x, 0), ms[x])
     cheap = sorted((x for x in cands if ms[x] <= EXPENSIVE * 1000), key=order)
     expensive = {x for x in cands if ms[x] > EXPENSIVE * 1000}
     list_cost = split.best_split([(ms[x], x) for x in cands])[0] / 1000
     run_cost = sum(ms[x] for x in cheap) / 1000 + 0.2 + sum(
-        SETUP_COST.get(c, 0) for c in {"::".join(mp_id(mp, to_num, x).split("::")[:2]) for x in cheap})
+        setup_cost(c, p) for c in {"::".join(mp_id(mp, to_num, x).split("::")[:2]) for x in cheap})
     # A real edit to a fixture almost always breaks the test reading it, so running it
     # first only adds CPU: list such tests straight away.
     data_only = files and all(
@@ -236,6 +259,25 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
         p["final_static"] = set()
     p["expensive"] = expensive
     p["run_ids"] = [mp_id(mp, to_num, x) for x in p["run"]]
+    # classmates of each slow test among the cheap ones we run: if they all pass, the
+    # slow test is not listed even when other tests fail. When they are cheap next to
+    # the slow test, they run to the end even after the stop point.
+    run_set = set(p["run"])
+    cls_of = lambda x: "::".join(mp_id(mp, to_num, x).split("::")[:2])
+    p["sameclass"] = {}
+    must = set()
+    by_cls = {}
+    for e in expensive:
+        c = cls_of(e)
+        mates = {x for x in run_set if cls_of(x) == c}
+        p["sameclass"][e] = mates
+        by_cls.setdefault(c, [set(), 0])
+        by_cls[c][0] |= mates
+        by_cls[c][1] = max(by_cls[c][1], ms[e])
+    for c, (mates, worth) in by_cls.items():
+        if mates and sum(ms[x] for x in mates) / 1000 + setup_cost(c, p) < SENTINEL_RATIO * worth / 1000:
+            must |= mates
+    p["must"] = must
     p["timeouts"] = {x: 3.0 + 5.0 * ms[x] / 1000 for x in p["run"]}
     # locations: for the proxy rule, which expensive tests share code with cheap ones
     covered_by_cheap = True
@@ -288,9 +330,10 @@ def run_all(runner, to_run, plans, deadline):
         while queue and len(active) < PARALLEL and time.time() < deadline:
             cid = queue.pop(0)
             p = plans[cid]
-            plan = [(tid, p["timeouts"][num] if "timeouts" in p else None) for tid, num in zip(p["run_ids"], p["run"])]
+            must = p.get("must", ())
+            plan = [(tid, p["timeouts"][num] if "timeouts" in p else None, num in must) for tid, num in zip(p["run_ids"], p["run"])]
             pid, fd = runner.start(SRC, p["patched"], p["deleted"], plan, p["imports"], p.get("purge", True),
-                                   STOP_AFTER_EXP if p.get("expensive") else 1)
+                                   STOP_AFTER_EXP if p.get("expensive") else 1, lazy_ok(p))
             active[fd] = [cid, pid, b"", time.time()]
         if not active:
             break
@@ -348,6 +391,9 @@ def handle(p, msg):
     k = msg.get("kind")
     if k == "test":
         p["results"][msg["id"]] = msg["ok"]
+        p["tcpu"] = p.get("tcpu", 0) + msg.get("cpu", 0)
+        if DEBUG:
+            p.setdefault("tlist", []).append((msg.get("cpu", 0), msg["id"]))
     elif k == "import":
         p["imports_ok"][msg["module"]] = msg["ok"]
         if not msg["ok"]:
@@ -383,10 +429,17 @@ def finalize(p):
             final |= p["import_fail"].get(m, set())
             final |= set(p["cands"])
     exp = p.get("expensive", set())
-    if exp:
-        if (len(failed) >= STOP_AFTER_EXP or p.get("stopped") or unknown
-                or not p.get("proxy_ok", True) or not p.get("run")):
-            final |= exp
+    for e in exp:
+        if not p.get("proxy_ok", True) or not p.get("run"):
+            final.add(e)
+            continue
+        mates = p.get("sameclass", {}).get(e)
+        if not mates:
+            # nothing like it ran: any sign of breakage lists it
+            if failed or unknown or p.get("stopped"):
+                final.add(e)
+        elif mates & (failed | unknown):
+            final.add(e)
     return final
 
 

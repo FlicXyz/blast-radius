@@ -218,6 +218,41 @@ class _BlankLambdas(ast.NodeTransformer):
         return node
 
 
+class _NoneEq(ast.NodeTransformer):
+    """`x is None` and `x == None` agree for every value whose __eq__ is the default
+    or returns False for None, which holds for sqlglot's own types. The same goes for
+    members of the enums below."""
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and any(_singleton(c) for c in (node.left, node.comparators[0])):
+            if isinstance(node.ops[0], ast.Is):
+                node.ops = [ast.Eq()]
+            elif isinstance(node.ops[0], ast.IsNot):
+                node.ops = [ast.NotEq()]
+        return node
+
+
+# Enums of the pinned sqlglot whose attributes only ever hold members: a member equals
+# only itself under ==. Enums with a str mixin that may meet plain strings are left out.
+_SAFE_ENUMS = {"DType", "ErrorLevel", "PropertiesLocation", "IsPredicatePrecedence", "ScopeType",
+               "TrieResult", "TokenType", "NormalizationStrategy"}
+
+
+def _singleton(c):
+    if isinstance(c, ast.Constant) and c.value is None:
+        return True
+    if isinstance(c, ast.Attribute) and re.fullmatch(r"[A-Z][A-Z0-9_]*", c.attr):
+        v = c.value
+        name = v.attr if isinstance(v, ast.Attribute) else getattr(v, "id", None)
+        return name in _SAFE_ENUMS
+    return False
+
+
+def none_eq_dump(text):
+    return strip_dump(_NoneEq().visit(ast.parse(text)))
+
+
 def lambda_blind_dump(text):
     return strip_dump(_BlankLambdas().visit(ast.parse(text)))
 
@@ -524,6 +559,9 @@ class Analyzer:
         old_scopes = self.scopes(path, old_text)
         if strip_dump(old_scopes.tree) == strip_dump(new_tree):
             res.add(set(), f"no-op (comments/format) {path}")
+            return
+        if not is_test and none_eq_dump(old_text) == none_eq_dump(new_text):
+            res.add(set(), f"no-op (is / == on a singleton) {path}")
             return
         if not is_test:
             res.import_modules.add(_module_name(path))
