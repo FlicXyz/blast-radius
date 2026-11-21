@@ -583,6 +583,19 @@ class Analyzer:
                     break
             if isinstance(c, ast.ClassDef):
                 break
+        top_lambda = isinstance(func, ast.Lambda) and not any(
+            isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) for c in chain)
+        if top_lambda:
+            # a lambda in a class/module-level literal: its callers, plus whatever the
+            # enclosing statement means at class/module level
+            res.add(mp.line_tests(path, func.lineno, func.end_lineno), f"lambda {path}:{line}")
+            stmt = None
+            for st, en, nd, ch in osc.nodes:
+                if isinstance(nd, ast.stmt) and st <= line <= en and (stmt is None or (en - st) < (stmt[1] - stmt[0])):
+                    stmt = (st, en, nd, ch)
+            if stmt is not None:
+                start, end, node, chain = stmt
+            func = None
         if func is not None:
             # runtime code: tests that executed the statement
             stmt = node

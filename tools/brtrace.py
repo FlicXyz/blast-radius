@@ -23,6 +23,13 @@ def on_line(code, line):
         cur.add((f, line if code.co_flags & 1 else -line))
     return mon.DISABLE
 
+def on_start(code, offset):
+    # one-line functions/lambdas get no LINE event for their only line
+    f = keep(code.co_filename)
+    if f is not False and code.co_flags & 1:
+        cur.add((f, code.co_firstlineno))
+    return mon.DISABLE
+
 def phase(name):
     global cur
     cur = lines[name]
@@ -98,7 +105,8 @@ def start(root):
     builtins.__import__ = _imp
     mon.use_tool_id(TOOL, "brtrace")
     mon.register_callback(TOOL, mon.events.LINE, on_line)
-    mon.set_events(TOOL, mon.events.LINE)
+    mon.register_callback(TOOL, mon.events.PY_START, on_start)
+    mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
 
 def dump(path):
     out = {"import": sorted(lines["import"]), "test": sorted(lines["test"]),

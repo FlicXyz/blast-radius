@@ -20,6 +20,14 @@ for fn in glob.glob(os.path.join(covdir, "*.json")):
     for c in d.get("classes", []): classes[c].add(i)
     for tk in d.get("tokens", []): tokens[tk].add(i)
     for w in d.get("words", []): words[w].add(i)
+# PY_START on class bodies / modules (older tracer) recorded their first line as runtime: drop those
+for f in sorted({f for f, _ in lines}):
+    p = os.path.join(srcroot, f)
+    if not f.endswith(".py") or not os.path.exists(p): continue
+    tree = ast.parse(open(p).read())
+    heads = {1} | {n.lineno for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+    for h in heads:
+        lines.pop((f, h), None)
 # names referenced on runtime lines
 names = collections.defaultdict(set)
 for f in sorted({f for f, _ in lines}):
