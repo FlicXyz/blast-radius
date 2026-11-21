@@ -36,7 +36,7 @@ EXPENSIVE = 2.0      # seconds: tests above this are not run, only reasoned abou
 PARALLEL = 2
 # With slow candidates in play, keep running after a failure: changes that break
 # the slow tests break many cheap ones too, so a handful of failures decides it.
-STOP_AFTER_EXP = 3
+STOP_AFTER_EXP = 1
 CPU_FACTOR = 1.5     # assumed board CPU seconds per recorded test second
 # CPU seconds of class-level fixtures (setUpClass) at the pinned commit; the
 # recorded per-test seconds don't include them.
@@ -535,7 +535,7 @@ def finalize(p):
             continue
         # the rule the board has confirmed: list slow tests once 3 cheap tests fail
         # (or the run could not finish) ...
-        broad = len(failed) >= STOP_AFTER_EXP or p.get("stopped") or unknown
+        broad = len(failed) >= 3 or p.get("stopped") or unknown
         # ... except when every classmate in play ran and passed
         mates = p.get("sameclass", {}).get(e)
         if broad and (not mates or mates & (failed | unknown)):
