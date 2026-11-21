@@ -1,0 +1,342 @@
+"""Runs chosen sqlglot tests against a patched tree, in a forked child.
+
+The pinned checkout is read-only, so a patch is applied by writing the changed
+files under /tmp and pointing imports and file reads at them:
+
+* patched modules are served by a meta-path finder,
+* patched data files (fixtures) are served by wrapping open()/gzip.open().
+
+Each child imports sqlglot fresh, so nothing from one commit leaks into the
+next. Results stream back over a pipe one test at a time, so a child that is
+killed (hang, crash) still reports everything it finished.
+"""
+
+import importlib.abc
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import pickle
+import signal
+import sys
+import time
+import traceback
+
+SRC = None
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+class _PatchedLoader(importlib.machinery.SourceFileLoader):
+    """Loads a module from its real path (so __file__ is unchanged) but with the patched source."""
+
+    def __init__(self, fullname, path, source):
+        super().__init__(fullname, path)
+        self._source = source
+
+    def get_data(self, path):
+        if path == self.path:
+            return self._source
+        return super().get_data(path)
+
+    def get_code(self, fullname):
+        return compile(self._source, self.path, "exec", dont_inherit=True)
+
+
+class _PatchedFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, modules):
+        self.modules = modules  # module name -> (real path, patched bytes or None if deleted, is_package)
+
+    def find_spec(self, fullname, path=None, target=None):
+        hit = self.modules.get(fullname)
+        if hit is None:
+            return None
+        real, source, is_pkg = hit
+        if source is None:
+            raise ModuleNotFoundError(f"No module named {fullname!r}", name=fullname)
+        loader = _PatchedLoader(fullname, real, source)
+        return importlib.util.spec_from_file_location(
+            fullname, real, loader=loader,
+            submodule_search_locations=[os.path.dirname(real)] if is_pkg else None,
+        )
+
+
+class _SyncPool:
+    """Stands in for ProcessPoolExecutor: runs tasks in-process (with a pickle
+    round trip, like the real pool) to avoid spawning interpreters."""
+
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
+        if initializer is not None:
+            initializer(*pickle.loads(pickle.dumps(initargs)))
+
+    def submit(self, fn, *args, **kwargs):
+        from concurrent.futures import Future
+        f = Future()
+        try:
+            a, k = pickle.loads(pickle.dumps((args, kwargs)))
+            r = fn(*a, **k)
+            f.set_result(pickle.loads(pickle.dumps(r)))
+        except BaseException as e:  # noqa
+            f.set_exception(e)
+        return f
+
+    def map(self, fn, *iterables, **kw):
+        return [self.submit(fn, *a).result() for a in zip(*iterables)]
+
+    def shutdown(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.shutdown()
+        return False
+
+
+class _Timeout(BaseException):
+    pass
+
+
+class _StopRun(BaseException):
+    pass
+
+
+STOP_ON_FAIL = True
+
+
+def _alarm(signum, frame):
+    raise _Timeout("test timed out")
+
+
+def _child(src, patched_files, deleted, plan, wfd, import_checks):
+    """plan: list of (test_id, timeout_s). Writes JSON lines to wfd."""
+    global SRC
+    SRC = src
+    out = os.fdopen(wfd, "w", buffering=1)
+
+    def emit(**kw):
+        out.write(json.dumps(kw) + "\n")
+        out.flush()
+
+    os.dup2(2, 1)  # nothing a test prints may reach our stdout
+    sys.stdout = sys.stderr
+    sys.dont_write_bytecode = True
+    os.environ["SKIP_INTEGRATION"] = "0"
+    os.chdir(src)
+    if src not in sys.path:
+        sys.path.insert(0, src)
+
+    # patched python modules
+    mods = {}
+    data = {}
+    for rel, tmp in patched_files.items():
+        if rel.endswith(".py") and (rel.startswith("sqlglot/") or rel.startswith("tests/")):
+            name = rel[:-3]
+            is_pkg = name.endswith("/__init__")
+            if is_pkg:
+                name = name[: -len("/__init__")]
+            with open(tmp, "rb") as fh:
+                mods[name.replace("/", ".")] = (os.path.join(src, rel), fh.read(), is_pkg)
+        data[os.path.join(src, rel)] = tmp
+    for rel in deleted:
+        if rel.endswith(".py"):
+            name = rel[:-3]
+            if name.endswith("/__init__"):
+                name = name[: -len("/__init__")]
+            mods[name.replace("/", ".")] = (os.path.join(src, rel), None, False)
+        data[os.path.join(src, rel)] = None
+    if mods:
+        sys.meta_path.insert(0, _PatchedFinder(mods))
+    if data:
+        import builtins
+        import gzip
+
+        def redirect(p):
+            if isinstance(p, (str, os.PathLike)):
+                ap = os.path.abspath(os.fspath(p))
+                if ap in data:
+                    if data[ap] is None:
+                        raise FileNotFoundError(2, "No such file or directory", os.fspath(p))
+                    return data[ap]
+            return p
+
+        _open = builtins.open
+        def open_(file, *a, **k):
+            return _open(redirect(file), *a, **k)
+        builtins.open = open_
+        io.open = open_
+        _gopen = gzip.open
+        def gopen(filename, *a, **k):
+            return _gopen(redirect(filename), *a, **k)
+        gzip.open = gopen
+        import pathlib
+        _rt = pathlib.Path.read_text
+        _rb = pathlib.Path.read_bytes
+        _po = pathlib.Path.open
+        pathlib.Path.read_text = lambda self, *a, **k: _rt(pathlib.Path(redirect(self)), *a, **k)
+        pathlib.Path.read_bytes = lambda self, *a, **k: _rb(pathlib.Path(redirect(self)), *a, **k)
+        pathlib.Path.open = lambda self, *a, **k: _po(pathlib.Path(redirect(self)), *a, **k)
+
+    import concurrent.futures
+    concurrent.futures.ProcessPoolExecutor = _SyncPool
+    import unittest
+
+    signal.signal(signal.SIGALRM, _alarm)
+
+    # import checks: does the patched code import at all?
+    for m in import_checks:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 20)
+            importlib.import_module(m)
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            emit(kind="import", module=m, ok=True)
+        except BaseException as e:  # noqa
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            emit(kind="import", module=m, ok=False, err=repr(e)[:300])
+
+    # group by test module and class, keeping order
+    groups = {}
+    for tid, to in plan:
+        path, cls, meth = tid.split("::")
+        groups.setdefault((path, cls), []).append((meth, to, tid))
+
+    class Result(unittest.TestResult):
+        def __init__(self):
+            super().__init__()
+            self.failed = set()
+
+        def _id(self, test):
+            return getattr(test, "_br_id", None)
+
+        def startTest(self, test):
+            super().startTest(test)
+            to = getattr(test, "_br_timeout", None)
+            if to:
+                signal.setitimer(signal.ITIMER_REAL, to)
+            test._br_t0 = time.process_time()
+
+        def stopTest(self, test):
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            super().stopTest(test)
+            tid = self._id(test)
+            if tid:
+                emit(kind="test", id=tid, ok=tid not in self.failed,
+                     cpu=round(time.process_time() - getattr(test, "_br_t0", time.process_time()), 3))
+                if STOP_ON_FAIL and tid in self.failed:
+                    raise _StopRun()
+
+        def _fail(self, test, err):
+            tid = self._id(test)
+            if tid:
+                self.failed.add(tid)
+            else:
+                # class/module fixture error: every test of the group fails
+                emit(kind="fixture_error", desc=str(test)[:200], err=str(err[1])[:200])
+                self.fixture_failed = True
+
+        def addError(self, test, err):
+            super().addError(test, err)
+            self._fail(test, err)
+
+        def addFailure(self, test, err):
+            super().addFailure(test, err)
+            self._fail(test, err)
+
+        def addSubTest(self, test, subtest, err):
+            if err is not None:
+                tid = self._id(test)
+                if tid:
+                    self.failed.add(tid)
+
+        def addUnexpectedSuccess(self, test):
+            super().addUnexpectedSuccess(test)
+            tid = self._id(test)
+            if tid:
+                self.failed.add(tid)
+
+    for (path, clsname), items in groups.items():
+        modname = path[:-3].replace("/", ".")
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 30)
+            mod = importlib.import_module(modname)
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            cls = getattr(mod, clsname)
+        except BaseException as e:  # noqa
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            for meth, to, tid in items:
+                emit(kind="test", id=tid, ok=False, err="import: " + repr(e)[:200])
+            continue
+        tests = []
+        for meth, to, tid in items:
+            try:
+                t = cls(meth)
+            except BaseException as e:  # noqa
+                emit(kind="test", id=tid, ok=False, err="init: " + repr(e)[:200])
+                continue
+            t._br_id = tid
+            t._br_timeout = to
+            tests.append(t)
+        suite = unittest.TestSuite(tests)
+        res = Result()
+        res.fixture_failed = False
+        stop = False
+        try:
+            suite.run(res)
+        except _StopRun:
+            stop = True
+        except BaseException as e:  # noqa
+            emit(kind="group_error", err=repr(e)[:200])
+        if res.fixture_failed:
+            emit(kind="group_failed", tests=[tid for _, _, tid in items])
+            stop = stop or STOP_ON_FAIL
+        if stop:
+            emit(kind="stopped")
+            break
+        # class cleanups/teardown of the module
+        try:
+            unittest.suite._call_if_exists(res, "_restoreStdout")
+        except Exception:
+            pass
+    emit(kind="done")
+    out.close()
+    os._exit(0)
+
+
+def start(src, patched_files, deleted, plan, import_checks):
+    """Forks a child running plan; returns (pid, read file)."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            _child(src, patched_files, deleted, plan, w, import_checks)
+        except BaseException:  # noqa
+            traceback.print_exc()
+        os._exit(1)
+    os.close(w)
+    os.set_blocking(r, False)
+    return pid, r
+
+
+def preload():
+    """Third-party and stdlib modules the tests import, loaded once before forking."""
+    for m in ("unittest", "unittest.mock", "json", "csv", "gzip", "sqlite3", "decimal", "datetime",
+              "tempfile", "concurrent.futures", "multiprocessing", "doctest", "tracemalloc", "gc",
+              "textwrap", "itertools", "functools", "re", "typing", "dataclasses", "enum",
+              "collections", "copy", "pickle", "logging", "math", "uuid", "pathlib", "inspect"):
+        try:
+            importlib.import_module(m)
+        except Exception:
+            pass
+
+
+def preload_heavy():
+    for m in ("numpy", "pandas", "pandas.testing", "duckdb"):
+        try:
+            importlib.import_module(m)
+        except Exception:
+            pass
