@@ -105,7 +105,21 @@ class _StopRun(BaseException):
     pass
 
 
-STATE = {"failures": 0, "stop_after": 1, "lazy": False}
+STATE = {"failures": 0, "stop_after": 1, "lazy": False, "filters": {}, "filter": None, "cont": set()}
+
+
+def _filter_fixtures(mod):
+    """While a test with a case filter runs, its fixture loop sees only those cases."""
+    orig = mod.load_sql_fixture_pairs
+
+    def pairs(filename):
+        keep = STATE["filter"]
+        for meta, sql, expected in orig(filename):
+            if keep is None or sql in keep:
+                yield meta, sql, expected
+
+    mod.load_sql_fixture_pairs = pairs
+    mod._br_filtered = True
 
 # Class fixtures that only build data a few tests read: built on first use instead.
 # Applies only when nothing the fixture runs is patched (the selector checks), so it
@@ -259,6 +273,9 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, st
             emit(kind="import", module=m, ok=False, err=repr(e)[:300])
 
     must = {e[0] for e in plan if len(e) > 2 and e[2]}
+    STATE["filters"] = {e[0]: set(e[3]) for e in plan if len(e) > 3 and e[3] is not None}
+    # a failure at one of these does not stop the run: what follows is cheaper to run than to list
+    STATE["cont"] = {e[0] for e in plan if len(e) > 4 and e[4]}
     done_ids = set()
     stopped = _run_groups([(e[0], e[1]) for e in plan], emit, done_ids)
     if stopped:
@@ -292,6 +309,7 @@ def _run_groups(plan, emit, done_ids):
 
         def startTest(self, test):
             super().startTest(test)
+            STATE["filter"] = getattr(test, "_br_filter", None)
             to = getattr(test, "_br_timeout", None)
             if to:
                 signal.setitimer(signal.ITIMER_REAL, to)
@@ -299,6 +317,7 @@ def _run_groups(plan, emit, done_ids):
 
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
+            STATE["filter"] = None
             super().stopTest(test)
             tid = self._id(test)
             if tid:
@@ -307,7 +326,7 @@ def _run_groups(plan, emit, done_ids):
                      cpu=round(time.process_time() - getattr(test, "_br_t0", time.process_time()), 3))
                 if tid in self.failed:
                     STATE["failures"] += 1
-                    if STATE["failures"] >= STATE["stop_after"]:
+                    if STATE["failures"] >= STATE["stop_after"] and tid not in STATE["cont"]:
                         raise _StopRun()
 
         def _fail(self, test, err):
@@ -346,6 +365,8 @@ def _run_groups(plan, emit, done_ids):
             mod = importlib.import_module(modname)
             signal.setitimer(signal.ITIMER_REAL, 0)
             cls = getattr(mod, clsname)
+            if STATE["filters"] and hasattr(mod, "load_sql_fixture_pairs") and not getattr(mod, "_br_filtered", False):
+                _filter_fixtures(mod)
             if STATE["lazy"] and (path, clsname) in LAZY_SETUP and not getattr(cls, "_br_lazy", False):
                 _lazy_class_setup(cls)
                 cls._br_lazy = True
@@ -365,6 +386,7 @@ def _run_groups(plan, emit, done_ids):
                 continue
             t._br_id = tid
             t._br_timeout = to
+            t._br_filter = STATE["filters"].get(tid)
             tests.append(t)
         suite = unittest.TestSuite(tests)
         res = Result()

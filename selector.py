@@ -11,6 +11,7 @@ For each patch:
    was shown to break something or nothing cheap covers the same code.
 """
 
+import gzip
 import json
 import os
 import select
@@ -26,6 +27,7 @@ import split  # noqa: E402
 DATA = os.environ.get("BR_DATA", "/data")
 SRC = os.environ.get("BR_SRC", "/app/sqlglot")
 MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.json.gz"))
+CASES = os.environ.get("BR_CASES", os.path.join(HERE, "cases.json.gz"))
 TMP = os.environ.get("BR_TMP", "/tmp/br")
 
 DEBUG = os.environ.get("BR_DEBUG")
@@ -35,6 +37,7 @@ PARALLEL = 2
 # With slow candidates in play, keep running after a failure: changes that break
 # the slow tests break many cheap ones too, so a handful of failures decides it.
 STOP_AFTER_EXP = 1
+CPU_FACTOR = 1.5     # assumed board CPU seconds per recorded test second
 # CPU seconds of class-level fixtures (setUpClass) at the pinned commit; the
 # recorded per-test seconds don't include them.
 SETUP_COST = {"tests/test_executor.py::TestExecutor": 1.3}
@@ -158,6 +161,67 @@ LAZY_DEPS = ("sqlglot/executor/table.py", "tests/helpers.py", "tests/test_execut
              "tests/fixtures/optimizer/tpc-h/", "tests/fixtures/optimizer/tpc-ds/")
 
 
+_cases = {}
+
+
+def load_cases():
+    if "d" not in _cases:
+        try:
+            with gzip.open(CASES, "rt") as fh:
+                _cases["d"] = json.load(fh)
+        except (OSError, ValueError):
+            _cases["d"] = {"tests": {}, "sets": []}
+    return _cases["d"]
+
+
+def case_filters(res, mp, to_num):
+    """num -> (SQLs of the fixture cases to run, number of cases) for candidates whose
+    selection rests only on changed lines that just some of their cases execute."""
+    cm = None
+    out = {}
+    for i in res.cands:
+        tid = mp.tests[i]
+        if not tid.startswith("tests/test_optimizer.py::TestOptimizer::") or to_num[i] is None:
+            continue
+        if cm is None:
+            cm = load_cases()
+        info = cm["tests"].get(tid)
+        if info is None:
+            continue
+        sel, full = set(), False
+        for tests, ranges in res.ranged:
+            if i not in tests:
+                continue
+            if ranges is None:
+                full = True
+                break
+            for f, lo, hi in ranges:
+                for l in range(lo, hi + 1):
+                    if i not in mp.line_tests(f, l, l):
+                        continue
+                    k = info["lines"].get(f"{f}:{l}")
+                    if k is None:
+                        full = True
+                        break
+                    sel.update(cm["sets"][k])
+                if full:
+                    break
+            if full:
+                break
+        if not full:
+            out[to_num[i]] = ([info["sqls"][j] for j in sorted(sel)], len(info["sqls"]))
+    return out
+
+
+def split_estimate(total, biggest, n):
+    """Seconds that listing n tests of this total and largest duration costs (LPT bound)."""
+    best = None
+    for k in range(1, min(8, n) + 1):
+        c = max(biggest, total / k) / 1000 + 2 * k
+        best = c if best is None else min(best, c)
+    return best or 0
+
+
 def setup_cost(c, p):
     if lazy_ok(p) and tuple(c.split("::")) in LAZY_CLASSES:
         return 0.0
@@ -232,10 +296,16 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
         tf = os.path.basename(tid.split("::")[0])[5:-3]
         setup = setup_cost("::".join(tid.split("::")[:2]), p)
         return (setup > 0.5, -(tf in stems), -hits.get(x, 0), ms[x])
-    cheap = sorted((x for x in cands if ms[x] <= EXPENSIVE * 1000), key=order)
-    expensive = {x for x in cands if ms[x] > EXPENSIVE * 1000}
+    # fixture-driven tests whose changed lines only some fixture cases reach run just those
+    filters = case_filters(res, mp, to_num)
+    p["filters"] = filters
+    eff = dict((x, ms[x]) for x in cands)
+    for x, (keep, total) in filters.items():
+        eff[x] = round(ms[x] * len(keep) / max(total, 1)) + 5
+    cheap = sorted((x for x in cands if eff[x] <= EXPENSIVE * 1000), key=lambda x: order(x)[:3] + (eff[x],))
+    expensive = {x for x in cands if eff[x] > EXPENSIVE * 1000}
     list_cost = split.best_split([(ms[x], x) for x in cands])[0] / 1000
-    run_cost = sum(ms[x] for x in cheap) / 1000 + 0.2 + sum(
+    run_cost = sum(eff[x] for x in cheap) / 1000 + 0.2 + sum(
         setup_cost(c, p) for c in {"::".join(mp_id(mp, to_num, x).split("::")[:2]) for x in cheap})
     # A real edit to a fixture almost always breaks the test reading it, so running it
     # first only adds CPU: list such tests straight away.
@@ -289,7 +359,20 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
         if mates and sum(ms[x] for x in mates) / 1000 + setup_cost(c, p) < SENTINEL_RATIO * worth / 1000:
             must |= mates
     p["must"] = must
+    # after a failure at position i, keep going when running the rest costs less CPU
+    # than listing it would cost in simulated time
+    p["cont"] = set()
+    run = p["run"]
+    run_sum, list_sum, list_max, n = 0, 0, 0, 0
+    for i in range(len(run) - 1, -1, -1):
+        if n and run_sum / 1000 * CPU_FACTOR < split_estimate(list_sum, list_max, n):
+            p["cont"].add(run[i])
+        x = run[i]
+        run_sum += eff[x]; list_sum += ms[x]; list_max = max(list_max, ms[x]); n += 1
     p["timeouts"] = {x: 3.0 + 5.0 * ms[x] / 1000 for x in p["run"]}
+    p["filters"] = {x: v for x, v in filters.items() if x in set(p["run"])}
+    if p["filters"]:
+        p["note"] += " cases(" + ",".join(f"{len(k)}/{n}" for k, n in p["filters"].values()) + ")"
     # locations: for the proxy rule, which expensive tests share code with cheap ones
     covered_by_cheap = True
     if expensive and p["run"]:
@@ -342,7 +425,10 @@ def run_all(runner, to_run, plans, deadline):
             cid = queue.pop(0)
             p = plans[cid]
             must = p.get("must", ())
-            plan = [(tid, p["timeouts"][num] if "timeouts" in p else None, num in must) for tid, num in zip(p["run_ids"], p["run"])]
+            flt = p.get("filters", {})
+            plan = [(tid, p["timeouts"][num] if "timeouts" in p else None, num in must,
+                     flt[num][0] if num in flt else None, num in p.get("cont", ()))
+                    for tid, num in zip(p["run_ids"], p["run"])]
             pid, fd = runner.start(SRC, p["patched"], p["deleted"], plan, p["imports"], p.get("purge", True),
                                    STOP_AFTER_EXP if p.get("expensive") else 1, lazy_ok(p))
             active[fd] = [cid, pid, b"", time.time()]
@@ -449,8 +535,10 @@ def finalize(p):
             continue
         mates = p.get("sameclass", {}).get(e)
         if not mates:
-            # nothing like it ran: any sign of breakage lists it
-            if failed or unknown or p.get("stopped"):
+            # nothing like it ran: a slow test with no classmates in play failed in our
+            # data only alongside widespread breakage, so list it on several failures
+            # or when the run ended before we could tell
+            if len(failed) >= 3 or unknown:
                 final.add(e)
         elif mates & (failed | unknown):
             final.add(e)

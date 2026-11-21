@@ -330,16 +330,18 @@ class Result:
         self.cands = set()          # map indices of candidate tests
         self.reasons = []
         self.locs = []
+        self.ranged = []            # (tests, [(path, lo, hi)] or None when not line-based)
         self.import_modules = set() # sqlglot modules to import-check at run time
         self.import_fail_tests = {} # module -> tests that fail if it doesn't import
         self.everything = False
         self.files_changed = []
 
-    def add(self, tests, why):
+    def add(self, tests, why, ranges=None):
         tests = set(tests)
         self.cands |= tests
         self.reasons.append((why, len(tests)))
         self.locs.append((why, tests))
+        self.ranged.append((tests, ranges))
 
 
 def _atoms(node):
@@ -677,10 +679,12 @@ class Analyzer:
             else:
                 lo, hi = start, end
             s = mp.line_tests(path, lo, hi)
+            ranges = [(path, lo, hi)]
             if not s and insert:
                 # inserted next to code nobody ran: use the enclosing function
                 s = self._func_tests(path, func)
-            res.add(s, f"runtime {path}:{line} [{lo}-{hi}]")
+                ranges = None
+            res.add(s, f"runtime {path}:{line} [{lo}-{hi}]", ranges)
             return
         if weak:
             return

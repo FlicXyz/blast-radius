@@ -16,7 +16,7 @@ tarfile.open(fileobj=io.BytesIO(data)).extractall('/app', filter='data')" \
  && python -m compileall -q -j 0 /app/sqlglot/sqlglot /app/sqlglot/tests \
  && chmod -R a+rX /app
 
-COPY selector.py analyze.py runner.py split.py map.json.gz /app/
+COPY selector.py analyze.py runner.py split.py map.json.gz cases.json.gz /app/
 RUN python -m compileall -q /app/*.py && chmod -R a+rX /app
 
 WORKDIR /app
