@@ -19,7 +19,10 @@ for fn in glob.glob(os.path.join(covdir, "*.json")):
     for f in d.get("opened", []): opened[f].add(i)
     for c in d.get("classes", []): classes[c].add(i)
     for tk in d.get("tokens", []): tokens[tk].add(i)
-    for w in d.get("words", []): words[w].add(i)
+    for w in d.get("words", []):
+        words[w].add(i)
+        n = " ".join(w.split())
+        if n != w: words[n].add(i)
 # PY_START on class bodies / modules (older tracer) recorded their first line as runtime: drop those
 for f in sorted({f for f, _ in lines}):
     p = os.path.join(srcroot, f)
@@ -30,6 +33,7 @@ for f in sorted({f for f, _ in lines}):
         lines.pop((f, h), None)
 # names referenced on runtime lines
 names = collections.defaultdict(set)
+tnames = collections.defaultdict(set)  # names referenced by test code itself
 for f in sorted({f for f, _ in lines}):
     p = os.path.join(srcroot, f)
     if not os.path.exists(p) or not f.endswith(".py"): continue
@@ -39,7 +43,9 @@ for f in sorted({f for f, _ in lines}):
         n = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else node.name if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else None
         if n is None: continue
         s = lines.get((f, node.lineno))
-        if s: names[n] |= s
+        if s:
+            names[n] |= s
+            if f.startswith("tests/"): tnames[n] |= s
 sets = {}; setlist = []
 def sid(s):
     k = tuple(sorted(s))
@@ -54,6 +60,7 @@ res = {"tests": tests, "lines": L,
        "tokens": {c: sid(s) for c, s in tokens.items()},
        "words": {c: sid(s) for c, s in words.items() if len(s) < N * 0.5},
        "names": {c: sid(s) for c, s in names.items()},
+       "tnames": {c: sid(s) for c, s in tnames.items()},
        }
 res["sets"] = setlist
 with gzip.open(out, "wt", compresslevel=9) as fh: json.dump(res, fh, separators=(",", ":"))

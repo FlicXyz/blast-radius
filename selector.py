@@ -30,6 +30,9 @@ TMP = os.environ.get("BR_TMP", "/tmp/br")
 
 EXPENSIVE = 2.0      # seconds: tests above this are not run, only reasoned about
 PARALLEL = 2
+# With slow candidates in play, keep running after a failure: changes that break
+# the slow tests break many cheap ones too, so a handful of failures decides it.
+STOP_AFTER_EXP = 3
 # CPU seconds of class-level fixtures (setUpClass) at the pinned commit; the
 # recorded per-test seconds don't include them.
 SETUP_COST = {"tests/test_executor.py::TestExecutor": 1.3}
@@ -114,6 +117,19 @@ def _main():
                 heavy.add(tid.split("::")[0])
         if any(needs_heavy(SRC, f) for f in heavy):
             runner.preload_heavy()
+        # commits that patch nothing the core import loads can reuse an imported sqlglot
+        shared = runner.preload_sqlglot(SRC)
+        for c in to_run:
+            p = plans[c]
+            mods = set()
+            for rel in list(p["patched"]) + list(p["deleted"]):
+                if rel.endswith(".py"):
+                    m = rel[:-3]
+                    if m.endswith("/__init__"):
+                        m = m[: -len("/__init__")]
+                    mods.add(m.replace("/", "."))
+            p["purge"] = not shared or any(m in sys.modules for m in mods)
+        log(f"shared sqlglot import: {shared}, {sum(not plans[c]['purge'] for c in to_run)} commits reuse it")
         run_all(runner, to_run, plans, deadline)
 
     for cid in commits:
@@ -258,7 +274,8 @@ def run_all(runner, to_run, plans, deadline):
             cid = queue.pop(0)
             p = plans[cid]
             plan = [(tid, p["timeouts"][num] if "timeouts" in p else None) for tid, num in zip(p["run_ids"], p["run"])]
-            pid, fd = runner.start(SRC, p["patched"], p["deleted"], plan, p["imports"])
+            pid, fd = runner.start(SRC, p["patched"], p["deleted"], plan, p["imports"], p.get("purge", True),
+                                   STOP_AFTER_EXP if p.get("expensive") else 1)
             active[fd] = [cid, pid, b"", time.time()]
         if not active:
             break
@@ -352,7 +369,8 @@ def finalize(p):
             final |= set(p["cands"])
     exp = p.get("expensive", set())
     if exp:
-        if failed or unknown or not p.get("proxy_ok", True) or not p.get("run"):
+        if (len(failed) >= STOP_AFTER_EXP or p.get("stopped") or unknown
+                or not p.get("proxy_ok", True) or not p.get("run")):
             final |= exp
     return final
 

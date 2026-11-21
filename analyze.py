@@ -173,6 +173,7 @@ class Map:
         self.tokens = d.get("tokens", {})
         self.words = d.get("words", {})
         self.names = d["names"]
+        self.tnames = d.get("tnames", {})
         self.all = frozenset(range(len(self.tests)))
         self.by_file = {}
         for i, t in enumerate(self.tests):
@@ -369,10 +370,11 @@ class Analyzer:
         return self.mp.get("classes", f"{module}:{qualname}")
 
     def class_users_by_name(self, name):
-        out = set()
+        """Tests that instantiated a class with this name, or None if no such class was ever seen."""
+        out = None
         for k, s in self.mp.classes.items():
             if k.rsplit(".", 1)[-1].split(":")[-1] == name:
-                out |= self.mp.sets[s]
+                out = (out or set()) | self.mp.sets[s]
         return out
 
     def name_users(self, name):
@@ -388,10 +390,10 @@ class Analyzer:
         if kind == "str":
             if not self.mp.words:
                 return None
-            v = val.upper().strip()
+            v = " ".join(val.upper().split())
             if not v:
                 return None
-            words = re.findall(r"[A-Z0-9_$@#]+|[^A-Z0-9_$@#\s]+", v)
+            words = [v] + re.findall(r"[A-Z0-9_$@#]+|[^A-Z0-9_$@#\s]+", v)
             out = set()
             known = False
             for w in words:
@@ -677,7 +679,7 @@ class Analyzer:
         users = self.class_users(osc.module, qual)
         # Enum members, constants read through the class: also anything naming the class
         if not users:
-            users = self.class_users_by_name(classes[-1].name)
+            users = self.class_users_by_name(classes[-1].name) or set()
         users = set(users) | self.name_users(classes[-1].name) & self._loaded(path)
         if isinstance(node, ast.ClassDef):
             # class header (bases, keywords): everything using it
@@ -700,6 +702,12 @@ class Analyzer:
                     ok = True
                     for k, v in changed:
                         got = None
+                        # a mapping entry only matters where its key turns up
+                        if k is not None and v is not None:
+                            ks = self._expr_users(path, k, strings=any(NAME_KEYED.search(t) for t in targets))
+                            if ks is not None:
+                                sub |= ks
+                                continue
                         for part in (k, v):
                             if part is None:
                                 continue
@@ -714,7 +722,11 @@ class Analyzer:
                         refined = sub
             base = users & readers if readers else users
             if refined is not None:
-                return base & refined
+                # tests that look at the attribute directly (e.g. iterate over it) see every entry
+                direct = set()
+                for t in targets:
+                    direct |= self.mp.get("tnames", t)
+                return (base & refined) | (base & direct)
             return base
         return users
 

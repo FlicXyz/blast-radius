@@ -105,14 +105,21 @@ class _StopRun(BaseException):
     pass
 
 
-STOP_ON_FAIL = True
+STATE = {"failures": 0, "stop_after": 1}
 
 
 def _alarm(signum, frame):
     raise _Timeout("test timed out")
 
 
-def _child(src, patched_files, deleted, plan, wfd, import_checks):
+def _purge():
+    for name in list(sys.modules):
+        if name == "sqlglot" or name.startswith("sqlglot.") or name == "tests" or name.startswith("tests."):
+            del sys.modules[name]
+
+
+def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, stop_after=1):
+    STATE["stop_after"] = stop_after
     """plan: list of (test_id, timeout_s). Writes JSON lines to wfd."""
     global SRC
     SRC = src
@@ -149,6 +156,8 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks):
                 name = name[: -len("/__init__")]
             mods[name.replace("/", ".")] = (os.path.join(src, rel), None, False)
         data[os.path.join(src, rel)] = None
+    if purge or any(m in sys.modules for m in mods):
+        _purge()
     if mods:
         sys.meta_path.insert(0, _PatchedFinder(mods))
     if data:
@@ -226,8 +235,10 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks):
             if tid:
                 emit(kind="test", id=tid, ok=tid not in self.failed,
                      cpu=round(time.process_time() - getattr(test, "_br_t0", time.process_time()), 3))
-                if STOP_ON_FAIL and tid in self.failed:
-                    raise _StopRun()
+                if tid in self.failed:
+                    STATE["failures"] += 1
+                    if STATE["failures"] >= STATE["stop_after"]:
+                        raise _StopRun()
 
         def _fail(self, test, err):
             tid = self._id(test)
@@ -292,7 +303,7 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks):
             emit(kind="group_error", err=repr(e)[:200])
         if res.fixture_failed:
             emit(kind="group_failed", tests=[tid for _, _, tid in items])
-            stop = stop or STOP_ON_FAIL
+            stop = True
         if stop:
             emit(kind="stopped")
             break
@@ -306,14 +317,14 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks):
     os._exit(0)
 
 
-def start(src, patched_files, deleted, plan, import_checks):
+def start(src, patched_files, deleted, plan, import_checks, purge=True, stop_after=1):
     """Forks a child running plan; returns (pid, read file)."""
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:
         os.close(r)
         try:
-            _child(src, patched_files, deleted, plan, w, import_checks)
+            _child(src, patched_files, deleted, plan, w, import_checks, purge, stop_after)
         except BaseException:  # noqa
             traceback.print_exc()
         os._exit(1)
@@ -332,6 +343,23 @@ def preload():
             importlib.import_module(m)
         except Exception:
             pass
+
+
+def preload_sqlglot(src):
+    """Imports the unpatched sqlglot core once, for commits whose patched modules it doesn't load."""
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    cwd = os.getcwd()
+    try:
+        os.chdir(src)
+        import sqlglot  # noqa: F401
+        import sqlglot.optimizer  # noqa: F401
+    except BaseException:  # noqa
+        _purge()
+        return False
+    finally:
+        os.chdir(cwd)
+    return True
 
 
 def preload_heavy():
