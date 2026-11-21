@@ -111,11 +111,9 @@ def _main():
     if to_run:
         import runner
         runner.preload()
-        heavy = set()
-        for c in to_run:
-            for tid in plans[c]["run_ids"]:
-                heavy.add(tid.split("::")[0])
-        if any(needs_heavy(SRC, f) for f in heavy):
+        # numpy/pandas/duckdb: load once here only if several children would load them
+        n_heavy = sum(1 for c in to_run if any(needs_heavy(SRC, t.split("::")[0]) for t in plans[c]["run_ids"]))
+        if n_heavy >= 2:
             runner.preload_heavy()
         # commits that patch nothing the core import loads can reuse an imported sqlglot
         shared = runner.preload_sqlglot(SRC)

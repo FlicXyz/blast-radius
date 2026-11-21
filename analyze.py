@@ -218,9 +218,8 @@ class _BlankLambdas(ast.NodeTransformer):
         return node
 
 
-def lambda_blind_dump(tree):
-    import copy
-    return strip_dump(_BlankLambdas().visit(copy.deepcopy(tree)))
+def lambda_blind_dump(text):
+    return strip_dump(_BlankLambdas().visit(ast.parse(text)))
 
 
 def strip_dump(tree):
@@ -544,8 +543,9 @@ class Analyzer:
             hunks = eff or hunks
         removed, inserted = change_points(hunks)
         new_scopes = Scopes(new_text, path)
-        # every difference sits inside lambda bodies: their callers are all that matter
-        self._lambda_only = lambda_blind_dump(old_scopes.tree) == lambda_blind_dump(new_tree)
+        # every difference sits inside lambda bodies: their callers are all that matter (computed lazily)
+        self._lambda_only = None
+        self._lambda_texts = (old_text, new_text)
         for ln in sorted(removed):
             self._locate(path, old_scopes, new_scopes, ln, None, res, is_test)
         for ln, added in inserted:
@@ -605,7 +605,10 @@ class Analyzer:
             # a lambda in a class/module-level literal: its callers, plus whatever the
             # enclosing statement means at class/module level
             res.add(mp.line_tests(path, func.lineno, func.end_lineno), f"lambda {path}:{line}")
-            if getattr(self, "_lambda_only", False):
+            if self._lambda_only is None:
+                o, n = self._lambda_texts
+                self._lambda_only = lambda_blind_dump(o) == lambda_blind_dump(n)
+            if self._lambda_only:
                 return
             stmt = None
             for st, en, nd, ch in osc.nodes:
