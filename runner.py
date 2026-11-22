@@ -105,7 +105,7 @@ class _StopRun(BaseException):
     pass
 
 
-STATE = {"failed_ids": set(), "failures": 0, "stop_after": 1, "lazy": False, "filters": {}, "filter": None, "cont": set()}
+STATE = {"failed_ids": set(), "failures": 0, "stop_after": 1, "lazy": False, "filters": {}, "filter": None, "cont": set(), "cont2": set()}
 
 
 EXEC_FILTERED = {
@@ -374,6 +374,7 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, st
     STATE["filters"] = {e[0]: set(e[3]) for e in plan if len(e) > 3 and e[3] is not None}
     # a failure at one of these does not stop the run: what follows is cheaper to run than to list
     STATE["cont"] = {e[0] for e in plan if len(e) > 4 and e[4]}
+    STATE["cont2"] = {e[0] for e in plan if len(e) > 5 and e[5]}
     done_ids = set()
     stopped = _run_groups([(e[0], e[1]) for e in plan], emit, done_ids)
     if stopped:
@@ -390,6 +391,7 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, st
             groups.setdefault(cls(e[0]), []).append(e)
         STATE["stop_after"] = 1
         STATE["cont"] = set()
+        STATE["cont2"] = set()
         for g in groups.values():
             STATE["failures"] = 0
             _run_groups(g, emit, done_ids)
@@ -445,7 +447,11 @@ def _run_groups(plan, emit, done_ids):
                 if tid in self.failed:
                     STATE["failed_ids"].add(tid)
                     STATE["failures"] += 1
-                    if STATE["failures"] >= STATE["stop_after"] and tid not in STATE["cont"]:
+                    # going on past a failure pays only if the rest passes: a second
+                    # failure says the change breaks broadly, so stop then
+                    if STATE["failures"] >= STATE["stop_after"] and (
+                            tid not in STATE["cont"] or (STATE["failures"] >= STATE["stop_after"] + 1
+                                                         and not (STATE["cont2"] - done_ids))):
                         raise _StopRun()
 
         def _fail(self, test, err):

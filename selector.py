@@ -410,6 +410,9 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
             p["cont"].add(run[i])
         x = run[i]
         run_sum += eff[x]; list_sum += ms[x]; list_max = max(list_max, ms[x]); n += 1
+    # tests far cheaper to run than to list (e.g. a slow test cut down to a few cases):
+    # worth reaching even after several failures
+    p["cont2"] = {x for x in run if ms[x] > 2000 and ms[x] > 4 * eff[x]}
     p["timeouts"] = {x: 3.0 + 5.0 * ms[x] / 1000 for x in p["run"]}
     p["filters"] = {x: v for x, v in filters.items() if x in set(p["run"])}
     if p["filters"]:
@@ -468,7 +471,7 @@ def run_all(runner, to_run, plans, deadline):
             must = p.get("must", ())
             flt = p.get("filters", {})
             plan = [(tid, p["timeouts"][num] if "timeouts" in p else None, num in must,
-                     flt[num][0] if num in flt else None, num in p.get("cont", ()))
+                     flt[num][0] if num in flt else None, num in p.get("cont", ()), num in p.get("cont2", ()))
                     for tid, num in zip(p["run_ids"], p["run"])]
             pid, fd = runner.start(SRC, p["patched"], p["deleted"], plan, p["imports"], p.get("purge", True),
                                    STOP_AFTER_EXP if p.get("expensive") else 1, lazy_ok(p))
