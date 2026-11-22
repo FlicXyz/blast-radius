@@ -161,13 +161,52 @@ def change_points(hunks):
 # ---------------------------------------------------------------- map
 
 
+class _LazySets:
+    """The map's test sets, made into frozensets when first used."""
+
+    def __init__(self, raw):
+        self.raw, self.c = raw, {}
+
+    def __getitem__(self, i):
+        r = self.c.get(i)
+        if r is None:
+            r = self.c[i] = frozenset(self.raw[i])
+        return r
+
+    def __len__(self):
+        return len(self.raw)
+
+
+class _LazyLines:
+    """file -> {line: set index}, with the line keys converted when the file is first used."""
+
+    def __init__(self, raw):
+        self.raw, self.c = raw, {}
+
+    def get(self, f, default=None):
+        r = self.c.get(f)
+        if r is None:
+            m = self.raw.get(f)
+            if m is None:
+                return default
+            r = self.c[f] = {int(k): v for k, v in m.items()}
+        return r
+
+
 class Map:
     def __init__(self, path):
-        with gzip.open(path, "rt") as fh:
-            d = json.load(fh)
+        fast = path[:-len(".json.gz")] + ".marshal" if path.endswith(".json.gz") else None
+        if fast and os.path.exists(fast):
+            # written at image build time by the same interpreter (see Dockerfile)
+            import marshal
+            with open(fast, "rb") as fh:
+                d = marshal.load(fh)
+        else:
+            with gzip.open(path, "rt") as fh:
+                d = json.load(fh)
         self.tests = d["tests"]
-        self.sets = [frozenset(s) for s in d["sets"]]
-        self.lines = {f: {int(k): v for k, v in m.items()} for f, m in d["lines"].items()}
+        self.sets = _LazySets(d["sets"])
+        self.lines = _LazyLines(d["lines"])
         self.opened = d["opened"]
         self.classes = d["classes"]
         self.tokens = d.get("tokens", {})
@@ -251,6 +290,69 @@ def _singleton(c):
 
 def none_eq_dump(text):
     return strip_dump(_NoneEq().visit(ast.parse(text)))
+
+
+def _stmt_same_text(texts, a, b):
+    """Same source lines (decorators included) and offsets: then the statements' trees are equal."""
+    if type(a) is not type(b):
+        return False
+    da, db = getattr(a, "decorator_list", ()), getattr(b, "decorator_list", ())
+    if len(da) != len(db):
+        return False
+    fa = min([a.lineno] + [d.lineno for d in da])
+    fb = min([b.lineno] + [d.lineno for d in db])
+    if a.end_lineno - fa != b.end_lineno - fb or a.col_offset != b.col_offset or a.end_col_offset != b.end_col_offset:
+        return False
+    if any(x.lineno - fa != y.lineno - fb or x.col_offset != y.col_offset for x, y in zip(da, db)):
+        return False
+    return texts[0][fa - 1:a.end_lineno] == texts[1][fb - 1:b.end_lineno]
+
+
+def _dump_t(node, transform):
+    if transform is not None:
+        import copy
+        node = transform(copy.deepcopy(node))
+    return strip_dump(node)
+
+
+def _stmts_equal(xs, ys, texts, transform):
+    if len(xs) != len(ys):
+        return False
+    for a, b in zip(xs, ys):
+        if _stmt_same_text(texts, a, b):
+            continue
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            # header by dump, body statement by statement
+            for f in a._fields:
+                if f == "body":
+                    continue
+                va, vb = getattr(a, f), getattr(b, f)
+                if isinstance(va, list):
+                    if len(va) != len(vb) or any(
+                            (_dump_t(x, transform) if isinstance(x, ast.AST) else x)
+                            != (_dump_t(y, transform) if isinstance(y, ast.AST) else y) for x, y in zip(va, vb)):
+                        return False
+                elif isinstance(va, ast.AST) or isinstance(vb, ast.AST):
+                    if not (isinstance(va, ast.AST) and isinstance(vb, ast.AST)) or _dump_t(va, transform) != _dump_t(vb, transform):
+                        return False
+                elif va != vb:
+                    return False
+            if not _stmts_equal(a.body, b.body, texts, transform):
+                return False
+            continue
+        if _dump_t(a, transform) != _dump_t(b, transform):
+            return False
+    return True
+
+
+def trees_equal(old_tree, new_tree, texts, transform=None):
+    """strip_dump(old) == strip_dump(new) (after transform, applied to copies), comparing
+    only the statements whose source differs."""
+    if texts is None or not isinstance(old_tree, ast.Module) or not isinstance(new_tree, ast.Module):
+        return _dump_t(old_tree, transform) == _dump_t(new_tree, transform)
+    return _stmts_equal(old_tree.body, new_tree.body, texts, transform)
 
 
 def lambda_blind_dump(text):
@@ -560,10 +662,14 @@ class Analyzer:
                 res.add(self._broad(path), f"syntax error {path}")
             return
         old_scopes = self.scopes(path, old_text)
-        if strip_dump(old_scopes.tree) == strip_dump(new_tree):
+        ob, nb = old_text.encode("utf-8", "surrogateescape"), new_text.encode("utf-8", "surrogateescape")
+        # line numbers count a lone CR as a line break too: compare whole trees then
+        btexts = None if b"\r" in ob or b"\r" in nb else (ob.split(b"\n"), nb.split(b"\n"))
+        self._btexts = btexts
+        if trees_equal(old_scopes.tree, new_tree, btexts):
             res.add(set(), f"no-op (comments/format) {path}")
             return
-        if not is_test and none_eq_dump(old_text) == none_eq_dump(new_text):
+        if not is_test and trees_equal(old_scopes.tree, new_tree, btexts, lambda t: _NoneEq().visit(t)):
             res.add(set(), f"no-op (is / == on a singleton) {path}")
             return
         if not is_test:
@@ -601,11 +707,12 @@ class Analyzer:
             self._locate(path, old_scopes, new_scopes, ln, added, res, is_test, insert=True)
         if not is_test and self.ops is not None:
             self._refine_compare(path, old_scopes.tree, new_tree, res, loc_start)
+            self._refine_dict(path, old_scopes.tree, new_tree, res, loc_start)
 
     def _refine_compare(self, path, old_tree, new_tree, res, start):
         """When the file's only change is one comparison's operator or constant operand,
         drop the tests whose recorded operands give the same result both ways."""
-        ch = single_compare_change(old_tree, new_tree)
+        ch = single_compare_change(old_tree, new_tree, getattr(self, "_btexts", None))
         if ch is None:
             return
         site = f"{path}:{ch['lineno']}:{ch['col']}"
@@ -621,6 +728,25 @@ class Analyzer:
             res.ranged[k] = (kept, res.ranged[k][1])
         res.cands = set().union(*(t for _, t in res.locs)) if res.locs else set()
         res.reasons.append((f"compare {site}: {dropped} unaffected", 0))
+
+    def _refine_dict(self, path, old_tree, new_tree, res, start):
+        """When the file's only changes are entries of module/class-level dict literals,
+        drop the tests that never looked up a changed key (nor read the whole dict)."""
+        chs = dict_entry_changes(old_tree, new_tree, getattr(self, "_btexts", None))
+        if not chs:
+            return
+        same = self.ops.dict_unaffected(path, chs)
+        if not same:
+            return
+        dropped = 0
+        for k in range(start, len(res.locs)):
+            why, tests = res.locs[k]
+            kept = tests - same
+            dropped += len(tests) - len(kept)
+            res.locs[k] = (why, kept)
+            res.ranged[k] = (kept, res.ranged[k][1])
+        res.cands = set().union(*(t for _, t in res.locs)) if res.locs else set()
+        res.reasons.append((f"dict {path} {[c['site'] for c in chs]}: {dropped} unaffected", 0))
 
     def _test_importers(self, path):
         out = set(self.mp.by_file.get(path, set()))
@@ -668,7 +794,8 @@ class Analyzer:
         if top_lambda:
             # a lambda in a class/module-level literal: its callers, plus whatever the
             # enclosing statement means at class/module level
-            res.add(mp.line_tests(path, func.lineno, func.end_lineno), f"lambda {path}:{line}")
+            res.add(mp.line_tests(path, func.lineno, func.end_lineno), f"lambda {path}:{line}",
+                    ranges=[(path, func.lineno, func.end_lineno)])
             if self._lambda_only is None:
                 o, n = self._lambda_texts
                 self._lambda_only = lambda_blind_dump(o) == lambda_blind_dump(n)
@@ -943,14 +1070,33 @@ _CMP_OPS = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=", ast.Gt: "
             ast.Is: "is", ast.IsNot: "is not"}
 
 
-def single_compare_change(old_tree, new_tree):
+def _seg(lines, n):
+    """Source bytes of node n (offsets are UTF-8 byte offsets)."""
+    if n.lineno == n.end_lineno:
+        return lines[n.lineno - 1][n.col_offset:n.end_col_offset]
+    return b"\n".join([lines[n.lineno - 1][n.col_offset:]] + lines[n.lineno:n.end_lineno - 1]
+                      + [lines[n.end_lineno - 1][:n.end_col_offset]])
+
+
+def _differs(a, b, texts):
+    """AST inequality, skipping the dump when both nodes have the same source text."""
+    if texts is not None:
+        try:
+            if _seg(texts[0], a) == _seg(texts[1], b):
+                return False
+        except (IndexError, AttributeError, TypeError):
+            pass
+    return strip_dump(a) != strip_dump(b)
+
+
+def single_compare_change(old_tree, new_tree, texts=None):
     """If the two modules differ only in one single-operator comparison's operator and/or
     one literal operand, describe the change; else None."""
     olds = [n for n in ast.walk(old_tree) if isinstance(n, ast.Compare)]
     news = [n for n in ast.walk(new_tree) if isinstance(n, ast.Compare)]
     if len(olds) != len(news):
         return None
-    diff = [(a, b) for a, b in zip(olds, news) if strip_dump(a) != strip_dump(b)]
+    diff = [(a, b) for a, b in zip(olds, news) if _differs(a, b, texts)]
     if len(diff) != 1:
         return None
     a, b = diff[0]
@@ -975,11 +1121,120 @@ def single_compare_change(old_tree, new_tree):
     try:
         for n in (a, b):
             n.left, n.ops, n.comparators = a2.left, a2.ops, a2.comparators
-        if strip_dump(old_tree) != strip_dump(new_tree):
+        if not trees_equal(old_tree, new_tree, texts):
             return None
     finally:
         a.left, a.ops, a.comparators, b.left, b.ops, b.comparators = saved
     return ch
+
+
+def _wrapped_dicts(tree):
+    """Dict literals outside any function or lambda, in the order opcov.py's rewriter sees them."""
+    out = []
+
+    def walk(n):
+        # literals inside functions are not wrapped: no need to look inside
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return
+        for c in ast.iter_child_nodes(n):
+            walk(c)
+        if isinstance(n, ast.Dict):
+            out.append(n)
+    walk(tree)
+    return out
+
+
+_ANY = ("<any>",)
+
+
+def _dict_key(k):
+    """A dict literal's key as compared with recorded lookups: a literal value, ("enum", NAME)
+    for an attribute (matches only recorded enum members of that name), else _ANY."""
+    if k is None:
+        return None
+    try:
+        v = ast.literal_eval(k)
+        if isinstance(v, (int, float, str, bool, tuple, type(None))):
+            return ("lit", v)
+    except (ValueError, SyntaxError, TypeError):
+        pass
+    if isinstance(k, ast.Attribute) and isinstance(k.value, (ast.Name, ast.Attribute)):
+        return ("enum", k.attr)
+    return _ANY
+
+
+def _entries(d):
+    """key -> value dump (last one wins), or None when an entry's key is unknown."""
+    m = {}
+    for k, v in zip(d.keys, d.values):
+        if k is None:
+            m[("**", strip_dump(v))] = None
+            continue
+        key = _dict_key(k)
+        if key is _ANY:
+            return None
+        m[key] = strip_dump(v)
+    return m
+
+
+def dict_entry_changes(old_tree, new_tree, texts=None):
+    """If the modules differ only inside module/class-level dict literals, list per innermost
+    changed literal its site, changed keys and whether its key set changed; else None."""
+    olds, news = _wrapped_dicts(old_tree), _wrapped_dicts(new_tree)
+    if len(olds) != len(news) or not olds:
+        return None
+    diff = [(a, b) for a, b in zip(olds, news) if _differs(a, b, texts)]
+    if not diff:
+        return None
+    ids = {id(a) for a, _ in diff}
+    inner = []
+    for a, b in diff:
+        # skip a literal whose difference may lie in a nested changed literal
+        if any(id(x) in ids for x in ast.walk(a) if x is not a):
+            continue
+        inner.append((a, b))
+    out = []
+    saved = []
+    try:
+        for a, b in inner:
+            ea, eb = _entries(a), _entries(b)
+            if ea is None or eb is None:
+                return None
+            if any(k[0] == "**" for k in set(ea) ^ set(eb)):
+                return None
+            ka = [k for k in ea if k[0] != "**"]
+            kb = [k for k in eb if k[0] != "**"]
+            changed = {k for k in set(ka) | set(kb) if ea.get(k, 0) != eb.get(k, 0)}
+            out.append({"site": f"{a.lineno}:{a.col_offset}", "keys": changed,
+                        "resized": set(ka) != set(kb)})
+            for n in (a, b):
+                saved.append((n, n.keys, n.values))
+                n.keys, n.values = [], []
+        # outer changed literals must now match, and nothing else may differ
+        if not trees_equal(old_tree, new_tree, texts):
+            return None
+    finally:
+        for n, k, v in saved:
+            n.keys, n.values = k, v
+    return out
+
+
+def _key_hit(rec, key):
+    """Could a lookup recorded as rec be a lookup of the changed key?"""
+    try:
+        r = _dec(rec)
+    except _Unknown:
+        return True
+    if key[0] == "enum":
+        return not isinstance(r, _E) or r.name == key[1]
+    if isinstance(r, _E):
+        return r == key[1]
+    if isinstance(r, tuple) and r[:1] in (("<class>",), ("<object>",)):
+        return False
+    try:
+        return r == key[1] or key[1] == r
+    except Exception:  # noqa
+        return True
 
 
 class _E:
@@ -1108,6 +1363,42 @@ class OpsMap:
                 if i is not None:
                     out.add(i)
         return out
+
+
+def _dict_unaffected(self, path, chs):
+    """Map indices of recorded tests that cannot see any of the dict entry changes."""
+    self._site(path + ":0:0")
+    d = self.files.get(path) or {}
+    if not path.startswith("sqlglot/") or not d.get("wrapped"):
+        # the recording never rewrote this file's literals: no lookup data
+        return set()
+    sites, dsets = d.get("dicts", {}), d.get("dsets", [])
+    hit = set()
+    for ch in chs:
+        groups = sites.get(f"{path}:{ch['site']}")
+        if not groups:
+            continue
+        for ks, tl in groups.items():
+            if ks == "u":
+                hit.update(tl)
+                continue
+            keys = dsets[int(ks)]
+            if ch["resized"] and "#len" in keys:
+                hit.update(tl)
+                continue
+            if any(k != "#len" and _key_hit(k, c) for k in keys for c in ch["keys"]):
+                hit.update(tl)
+    out = set()
+    for t, tid in enumerate(self.tests):
+        if t in hit:
+            continue
+        i = self.idx.get(tid)
+        if i is not None:
+            out.add(i)
+    return out
+
+
+OpsMap.dict_unaffected = _dict_unaffected
 
 
 def _dec_new(v):

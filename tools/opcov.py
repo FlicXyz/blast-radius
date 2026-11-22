@@ -83,10 +83,133 @@ def _brcmp_(site, a, op, b):
 
 builtins._brcmp_ = _brcmp_
 
+DREC = {}           # dict site -> set of encoded keys looked up, or None after a full read
+
+
+def _dnote(site, key):
+    s = DREC.get(site, ())
+    if s is None:
+        return
+    if s == ():
+        s = DREC[site] = set()
+    e = enc(key)
+    if e is UNK or len(s) > 256:
+        DREC[site] = None
+    else:
+        s.add(json.dumps(e))
+
+
+class BrDict(dict):
+    """A class/module-level dict literal that notes which keys get looked up."""
+    __slots__ = ("_site",)
+
+    def __getitem__(self, k):
+        _dnote(self._site, k)
+        return dict.__getitem__(self, k)
+
+    def get(self, k, *d):
+        _dnote(self._site, k)
+        return dict.get(self, k, *d)
+
+    def __contains__(self, k):
+        _dnote(self._site, k)
+        return dict.__contains__(self, k)
+
+    def setdefault(self, k, *d):
+        _dnote(self._site, k)
+        return dict.setdefault(self, k, *d)
+
+    def pop(self, k, *d):
+        _dnote(self._site, k)
+        return dict.pop(self, k, *d)
+
+    def _all(self):
+        DREC[self._site] = None
+
+    def __len__(self):
+        # truthiness and size: only key additions/removals change it
+        s = DREC.get(self._site, ())
+        if s is not None:
+            if s == ():
+                s = DREC[self._site] = set()
+            s.add('"#len"')
+        return dict.__len__(self)
+
+    def __reversed__(self):
+        self._all(); return dict.__reversed__(self)
+
+    def popitem(self):
+        self._all(); return dict.popitem(self)
+
+    def __iter__(self):
+        self._all(); return dict.__iter__(self)
+
+    def keys(self):
+        self._all(); return dict.keys(self)
+
+    def items(self):
+        self._all(); return dict.items(self)
+
+    def values(self):
+        self._all(); return dict.values(self)
+
+    def copy(self):
+        self._all(); return dict.copy(self)
+
+    def __eq__(self, o):
+        self._all(); return dict.__eq__(self, o)
+
+    def __ne__(self, o):
+        self._all(); return dict.__ne__(self, o)
+
+    def __or__(self, o):
+        self._all(); return dict.__or__(self, o)
+
+    def __ror__(self, o):
+        self._all(); return dict.__ror__(self, o)
+
+    def __repr__(self):
+        self._all(); return dict.__repr__(self)
+
+    def __reduce__(self):
+        self._all(); return (dict, (dict(dict.items(self)),))
+
+    __hash__ = None
+
+
+BrDict.__module__ = "builtins"
+builtins.BrDict = BrDict
+
+
+def _brdict_(site, d):
+    b = BrDict(d)
+    b._site = site
+    return b
+
+
+builtins._brdict_ = _brdict_
+
 
 class Rewriter(ast.NodeTransformer):
     def __init__(self, rel):
         self.rel = rel
+        self.depth = 0
+
+    def _func(self, node):
+        self.depth += 1
+        self.generic_visit(node)
+        self.depth -= 1
+        return node
+
+    visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _func
+
+    def visit_Dict(self, node):
+        self.generic_visit(node)
+        if self.depth:
+            return node
+        site = f"{self.rel}:{node.lineno}:{node.col_offset}"
+        call = ast.Call(func=ast.Name("_brdict_", ast.Load()), args=[ast.Constant(site), node], keywords=[])
+        return ast.copy_location(call, node)
 
     def visit_Compare(self, node):
         self.generic_visit(node)
@@ -99,10 +222,14 @@ class Rewriter(ast.NodeTransformer):
         return ast.copy_location(call, node)
 
 
+LOADED = set()
+
+
 class Loader(importlib.machinery.SourceFileLoader):
     def get_code(self, fullname):
         src = self.get_data(self.path).decode("utf-8")
         rel = os.path.relpath(self.path, ROOT)
+        LOADED.add(rel)
         tree = Rewriter(rel).visit(ast.parse(src))
         ast.fix_missing_locations(tree)
         return compile(tree, self.path, "exec", dont_inherit=True)
@@ -166,8 +293,9 @@ for tid in ids:
         except BaseException as e:  # noqa
             ok = repr(e)[:200]
         data = {s: (sorted(v) if v is not None else None) for s, v in REC.items() if v != ()}
+        dd = {s: (sorted(v) if v is not None else None) for s, v in DREC.items() if v != ()}
         with os.fdopen(w, "w") as fh:
-            json.dump({"id": tid, "ok": ok, "sites": data}, fh)
+            json.dump({"id": tid, "ok": ok, "sites": data, "dicts": dd, "loaded": sorted(LOADED)}, fh)
         os._exit(0)
     os.close(w)
     with os.fdopen(r) as fh:

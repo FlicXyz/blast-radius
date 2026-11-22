@@ -105,7 +105,7 @@ class _StopRun(BaseException):
     pass
 
 
-STATE = {"failures": 0, "stop_after": 1, "lazy": False, "filters": {}, "filter": None, "cont": set()}
+STATE = {"failed_ids": set(), "failures": 0, "stop_after": 1, "lazy": False, "filters": {}, "filter": None, "cont": set()}
 
 
 EXEC_FILTERED = {
@@ -289,10 +289,19 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, st
         emit(kind="stopped")
         # sentinels: classmates of slow tests, whose results decide whether the slow
         # tests are listed. They run to the end whatever else failed.
-        rest = [(e[0], e[1]) for e in plan if e[0] in must and e[0] not in done_ids]
-        if rest:
-            STATE["stop_after"] = 10 ** 9
-            _run_groups(rest, emit, done_ids)
+        # Once one of a class's sentinels fails its slow tests are listed anyway: the
+        # class's other sentinels are skipped.
+        cls = lambda t: "::".join(t.split("::")[:2])
+        bad = {cls(t) for t in STATE["failed_ids"]}
+        rest = [(e[0], e[1]) for e in plan if e[0] in must and e[0] not in done_ids and cls(e[0]) not in bad]
+        groups = {}
+        for e in rest:
+            groups.setdefault(cls(e[0]), []).append(e)
+        STATE["stop_after"] = 1
+        STATE["cont"] = set()
+        for g in groups.values():
+            STATE["failures"] = 0
+            _run_groups(g, emit, done_ids)
     emit(kind="done")
     out.close()
     os._exit(0)
@@ -336,6 +345,7 @@ def _run_groups(plan, emit, done_ids):
                 emit(kind="test", id=tid, ok=tid not in self.failed,
                      cpu=round(time.process_time() - getattr(test, "_br_t0", time.process_time()), 3))
                 if tid in self.failed:
+                    STATE["failed_ids"].add(tid)
                     STATE["failures"] += 1
                     if STATE["failures"] >= STATE["stop_after"] and tid not in STATE["cont"]:
                         raise _StopRun()

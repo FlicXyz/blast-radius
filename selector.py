@@ -149,6 +149,9 @@ def _main():
         PRINTED.add(cid)
         log(f"{cid}: cand={len(p.get('cands', ()))} ran={len(p.get('run', ()))} failed={len(p.get('failed', ()))} "
             f"final={len(final)} cost={cost/1000:.1f}s cpu={p.get('cpu', 0):.2f} tcpu={p.get('tcpu', 0):.2f} purge={p.get('purge')} {p.get('note', '')}")
+        if DEBUG:
+            st = {x for x in set(p.get("cands", ())) | set(p.get("expensive", ())) | set(p.get("final_static", ())) if x in ms}
+            log(f"   static={split.best_split([(ms[x], x) for x in st])[0]/1000:.2f}")
         if DEBUG and p.get("tlist"):
             rec = sum(ms.get(n, 0) for n in p.get("run", ())) / 1000
             log(f"   recorded={rec:.2f} top: " + "; ".join(f"{c:.2f} {t}" for c, t in sorted(p["tlist"], reverse=True)[:6]))
@@ -170,14 +173,20 @@ class LazyOps:
         self.mp = mp
         self.m = None
 
-    def unchanged_tests(self, site, ch):
+    def _load(self):
         if self.m is None:
             try:
                 self.m = analyze.OpsMap(OPS, self.mp.tests)
             except (OSError, ValueError) as e:
                 log(f"ops map unavailable: {e!r}")
                 self.m = False
-        return self.m.unchanged_tests(site, ch) if self.m else set()
+        return self.m
+
+    def unchanged_tests(self, site, ch):
+        return self._load().unchanged_tests(site, ch) if self._load() else set()
+
+    def dict_unaffected(self, path, chs):
+        return self._load().dict_unaffected(path, chs) if self._load() else set()
 
 
 _cases = {}
