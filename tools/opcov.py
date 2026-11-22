@@ -86,7 +86,7 @@ builtins._brcmp_ = _brcmp_
 DREC = {}           # dict site -> set of encoded keys looked up, or None after a full read
 
 
-def _dnote(site, key):
+def _dnote(site, key, presence=False):
     s = DREC.get(site, ())
     if s is None:
         return
@@ -96,7 +96,8 @@ def _dnote(site, key):
     if e is UNK or len(s) > 256:
         DREC[site] = None
     else:
-        s.add(json.dumps(e))
+        # a membership test only sees whether the key is there, not its value
+        s.add(json.dumps(["?", e]) if presence else json.dumps(e))
 
 
 class BrDict(dict):
@@ -112,7 +113,7 @@ class BrDict(dict):
         return dict.get(self, k, *d)
 
     def __contains__(self, k):
-        _dnote(self._site, k)
+        _dnote(self._site, k, presence=True)
         return dict.__contains__(self, k)
 
     def setdefault(self, k, *d):
@@ -190,6 +191,45 @@ def _brdict_(site, d):
 builtins._brdict_ = _brdict_
 
 
+TREC = set()        # (tokenizer class owning the core, core attribute) pairs read
+OWN = {}            # id(core) -> owner tokenizer class
+OWNCLS = {}
+
+
+def _brtok_(obj, name):
+    v = getattr(obj, name)
+    TREC.add((OWN.get(id(obj)), name))
+    return v
+
+
+builtins._brtok_ = _brtok_
+TOK_ATTRS = None    # TokenizerCore.__slots__, filled when the module is rewritten
+
+
+class TokRewriter(ast.NodeTransformer):
+    """In tokenizer_core.py: self.<slot> loads become _brtok_(self, "<slot>")."""
+
+    def __init__(self, names):
+        self.names = names
+
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        if (isinstance(node.ctx, ast.Load) and isinstance(node.value, ast.Name)
+                and node.value.id == "self" and node.attr in self.names):
+            call = ast.Call(func=ast.Name("_brtok_", ast.Load()), args=[node.value, ast.Constant(node.attr)], keywords=[])
+            return ast.copy_location(call, node)
+        return node
+
+
+def _core_slots(tree):
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ClassDef) and n.name == "TokenizerCore":
+            for st in n.body:
+                if isinstance(st, ast.Assign) and any(getattr(t, "id", None) == "__slots__" for t in st.targets):
+                    return {e.value for e in st.value.elts if isinstance(e, ast.Constant)}
+    return set()
+
+
 class Rewriter(ast.NodeTransformer):
     def __init__(self, rel):
         self.rel = rel
@@ -230,7 +270,10 @@ class Loader(importlib.machinery.SourceFileLoader):
         src = self.get_data(self.path).decode("utf-8")
         rel = os.path.relpath(self.path, ROOT)
         LOADED.add(rel)
-        tree = Rewriter(rel).visit(ast.parse(src))
+        tree = ast.parse(src)
+        if rel == "sqlglot/tokenizer_core.py":
+            tree = TokRewriter(_core_slots(tree)).visit(tree)
+        tree = Rewriter(rel).visit(tree)
         ast.fix_missing_locations(tree)
         return compile(tree, self.path, "exec", dont_inherit=True)
 
@@ -285,6 +328,19 @@ for tid in ids:
         ok = None
         try:
             path, cls, meth = tid.split("::")
+            try:
+                tokens = importlib.import_module("sqlglot.tokens")
+                orig_init_core = tokens.Tokenizer._init_core
+
+                def _init_core(self):
+                    core = orig_init_core(self)
+                    k = f"{type(self).__module__}.{type(self).__qualname__}"
+                    OWN[id(core)] = k
+                    OWNCLS[k] = type(self)
+                    return core
+                tokens.Tokenizer._init_core = _init_core
+            except Exception:  # noqa
+                pass
             mod = importlib.import_module(path[:-3].replace("/", "."))
             res = unittest.TestResult()
             signal.alarm(900)
@@ -294,8 +350,21 @@ for tid in ids:
             ok = repr(e)[:200]
         data = {s: (sorted(v) if v is not None else None) for s, v in REC.items() if v != ()}
         dd = {s: (sorted(v) if v is not None else None) for s, v in DREC.items() if v != ()}
+        # for each core owner: which class in its MRO defines each class attribute
+        definers = {}
+        for k, c in OWNCLS.items():
+            dm = {}
+            for name in dir(c):
+                if name.isupper():
+                    for b in c.__mro__:
+                        if name in b.__dict__:
+                            dm[name] = f"{b.__module__}.{b.__qualname__}"
+                            break
+            definers[k] = dm
+        tok = {"reads": sorted([o, a] for o, a in TREC if o is not None) + sorted([["", a] for o, a in TREC if o is None]),
+               "definers": definers}
         with os.fdopen(w, "w") as fh:
-            json.dump({"id": tid, "ok": ok, "sites": data, "dicts": dd, "loaded": sorted(LOADED)}, fh)
+            json.dump({"id": tid, "ok": ok, "sites": data, "dicts": dd, "loaded": sorted(LOADED), "tok": tok}, fh)
         os._exit(0)
     os.close(w)
     with os.fdopen(r) as fh:

@@ -709,6 +709,7 @@ class Analyzer:
         if not is_test and self.ops is not None:
             self._refine_compare(path, old_scopes.tree, new_tree, res, loc_start)
             self._refine_dict(path, old_scopes.tree, new_tree, res, loc_start)
+            self._refine_tok(path, old_scopes.tree, new_tree, res, loc_start)
 
     def _refine_compare(self, path, old_tree, new_tree, res, start):
         """When the file's only change is one comparison's operator or constant operand,
@@ -752,6 +753,56 @@ class Analyzer:
             res.ranged[k] = (kept, res.ranged[k][1])
         res.cands = set().union(*(t for _, t in res.locs)) if res.locs else set()
         res.reasons.append((f"dict {path} {[c['site'] for c in chs]}: {dropped} unaffected", 0))
+
+    def _refine_tok(self, path, old_tree, new_tree, res, start):
+        """When the file's only changes are constant tokenizer settings (class attributes
+        Tokenizer._init_core hands to TokenizerCore), keep only the tests whose tokenizers
+        of that class actually read the setting, or that run code naming it elsewhere."""
+        if not path.startswith("sqlglot/"):
+            return
+        chs = class_const_changes(old_tree, new_tree, getattr(self, "_btexts", None))
+        if not chs:
+            return
+        try:
+            tok = self.ops.tok()
+        except Exception:  # noqa
+            return
+        if not tok:
+            return
+        mod = _module_name(path)
+        known = {v for dm in tok["definers"].values() for v in dm.values()}
+        affected_ids, extra = set(), set()
+        for qual, name in chs:
+            attr = tok["attr_of"].get(name)
+            cls = f"{mod}.{qual}"
+            o = tok["others"].get(name)
+            if attr is None or o is None or o["broad"] or cls not in known:
+                return
+            for f, l in o["lines"]:
+                extra |= self.mp.line_tests(f, l, l)
+            for tf in o["test_files"]:
+                extra |= self.mp.by_file.get(tf, set())
+            for tid, reads in tok["tests"].items():
+                for oi, a in reads:
+                    if a == attr:
+                        owner = tok["owners"][oi]
+                        if not owner or tok["definers"].get(owner, {}).get(name) == cls:
+                            affected_ids.add(tid)
+                            break
+        idx = {t: i for i, t in enumerate(self.mp.tests)}
+        recorded = {idx[t] for t in tok["tests"] if t in idx}
+        same = recorded - {idx[t] for t in affected_ids if t in idx} - extra
+        if not same:
+            return
+        dropped = 0
+        for k in range(start, len(res.locs)):
+            why, tests = res.locs[k]
+            kept = tests - same
+            dropped += len(tests) - len(kept)
+            res.locs[k] = (why, kept)
+            res.ranged[k] = (kept, res.ranged[k][1])
+        res.cands = set().union(*(t for _, t in res.locs)) if res.locs else set()
+        res.reasons.append((f"tokenizer setting {chs}: {dropped} unaffected", 0))
 
     def _test_importers(self, path):
         out = set(self.mp.by_file.get(path, set()))
@@ -1211,7 +1262,7 @@ def dict_entry_changes(old_tree, new_tree, texts=None):
             kb = [k for k in eb if k[0] != "**"]
             changed = {k for k in set(ka) | set(kb) if ea.get(k, 0) != eb.get(k, 0)}
             out.append({"site": f"{a.lineno}:{a.col_offset}", "keys": changed,
-                        "resized": set(ka) != set(kb)})
+                        "resized": set(ka) != set(kb), "presence": set(ka) ^ set(kb)})
             for n in (a, b):
                 saved.append((n, n.keys, n.values))
                 n.keys, n.values = [], []
@@ -1222,6 +1273,50 @@ def dict_entry_changes(old_tree, new_tree, texts=None):
         for n, k, v in saved:
             n.keys, n.values = k, v
     return out
+
+
+def _class_assigns(tree):
+    """(class qualname, NAME, Assign) for single-name assignments directly in class bodies."""
+    out = []
+
+    def walk(body, qual):
+        for st in body:
+            if isinstance(st, ast.ClassDef):
+                walk(st.body, f"{qual}.{st.name}" if qual else st.name)
+            elif qual and isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                out.append((qual, st.targets[0].id, st))
+    walk(tree.body, "")
+    return out
+
+
+def class_const_changes(old_tree, new_tree, texts=None):
+    """If the modules differ only in the constant values of class-level NAME = <literal>
+    assignments, list the (class qualname, NAME) pairs changed; else None."""
+    olds, news = _class_assigns(old_tree), _class_assigns(new_tree)
+    if len(olds) != len(news) or any(a[:2] != b[:2] for a, b in zip(olds, news)):
+        return None
+    diff = [(a, b) for a, b in zip(olds, news) if _differs(a[2], b[2], texts)]
+    if not diff:
+        return None
+    saved = []
+    try:
+        for a, b in diff:
+            for x in (a[2].value, b[2].value):
+                try:
+                    v = ast.literal_eval(x)
+                except (ValueError, SyntaxError, TypeError):
+                    return None
+                if not isinstance(v, (bool, int, float, str, type(None))):
+                    return None
+            for st in (a[2], b[2]):
+                saved.append((st, st.value))
+                st.value = ast.Constant(0)
+        if not trees_equal(old_tree, new_tree, texts):
+            return None
+    finally:
+        for st, v in saved:
+            st.value = v
+    return [a[:2] for a, _ in diff]
 
 
 def _key_hit(rec, key):
@@ -1391,7 +1486,9 @@ def _dict_unaffected(self, path, chs):
             if ch["resized"] and "#len" in keys:
                 hit.update(tl)
                 continue
-            if any(k != "#len" and _key_hit(k, c) for k in keys for c in ch["keys"]):
+            pres = ch.get("presence", ch["keys"])
+            if any(k != "#len" and (_key_hit(k[1], c) and c in pres if isinstance(k, list) and k[:1] == ["?"]
+                                    else _key_hit(k, c)) for k in keys for c in ch["keys"]):
                 hit.update(tl)
     out = set()
     for t, tid in enumerate(self.tests):
@@ -1404,6 +1501,19 @@ def _dict_unaffected(self, path, chs):
 
 
 OpsMap.dict_unaffected = _dict_unaffected
+
+
+def _tok(self):
+    if not hasattr(self, "_tokd"):
+        try:
+            with gzip.open(os.path.join(self.dir, "tok.json.gz"), "rt") as fh:
+                self._tokd = json.load(fh)
+        except OSError:
+            self._tokd = None
+    return self._tokd
+
+
+OpsMap.tok = _tok
 
 
 def _changed_tests(self, site, ch):

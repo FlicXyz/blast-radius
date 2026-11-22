@@ -188,6 +188,9 @@ class LazyOps:
     def changed_tests(self, site, ch):
         return self._load().changed_tests(site, ch) if self._load() else set()
 
+    def tok(self):
+        return self._load().tok() if self._load() else None
+
     def dict_unaffected(self, path, chs):
         return self._load().dict_unaffected(path, chs) if self._load() else set()
 
