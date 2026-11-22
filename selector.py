@@ -275,7 +275,9 @@ def needs_heavy(src, rel):
             txt = open(os.path.join(src, rel)).read()
         except OSError:
             txt = ""
-        _heavy_cache[rel] = any(w in txt for w in ("import duckdb", "import pandas", "import numpy"))
+        # test_optimizer gets lazy stand-ins for duckdb/pandas.testing in the runner
+        _heavy_cache[rel] = rel != "tests/test_optimizer.py" and any(
+            w in txt for w in ("import duckdb", "import pandas", "import numpy"))
     return _heavy_cache[rel]
 
 

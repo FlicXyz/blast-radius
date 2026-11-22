@@ -179,6 +179,94 @@ def _lazy_class_setup(cls):
     cls.tearDownClass = classmethod(tearDownClass)
 
 
+class _LazyConn:
+    """duckdb.connect() with no arguments, opened for real on first use. While a class
+    fixture runs (no test started yet), execute() calls are queued and replayed in order
+    when the connection is first really needed: a connection's execute() returns the
+    connection, and the queued statements' results are never read in between."""
+
+    def __init__(self):
+        self._q, self._real = [], None
+
+    def _mat(self):
+        if self._real is None:
+            self._real = _real_module("duckdb").connect()
+            q, self._q = self._q, []
+            for a, k in q:
+                self._real.execute(*a, **k)
+        return self._real
+
+    def execute(self, *a, **k):
+        if self._real is None and not STATE.get("in_test"):
+            self._q.append((a, k))
+            return self
+        return self._mat().execute(*a, **k)
+
+    def close(self):
+        if self._real is not None:
+            self._real.close()
+        self._q = []
+
+    def __enter__(self):
+        return self._mat().__enter__()
+
+    def __exit__(self, *a):
+        return self._mat().__exit__(*a)
+
+    def __getattr__(self, n):
+        if n.startswith("__"):
+            raise AttributeError(n)
+        return getattr(self._mat(), n)
+
+
+_REAL = {}
+
+
+def _real_module(name):
+    m = _REAL.get(name)
+    if m is None:
+        stub = sys.modules.pop(name, None)
+        try:
+            m = _REAL[name] = importlib.import_module(name)
+        except BaseException:
+            if stub is not None:
+                sys.modules[name] = stub
+            raise
+    return m
+
+
+def _install_lazy_heavy():
+    """duckdb and pandas.testing as stand-ins that import the real module on first use:
+    test_optimizer imports both at the top, but most of its tests never touch them."""
+    import types
+
+    class LazyDuck(types.ModuleType):
+        def __getattr__(self, n):
+            if n.startswith("__"):
+                raise AttributeError(n)
+            if n == "connect":
+                def connect(*a, **k):
+                    if a or k:
+                        return _real_module("duckdb").connect(*a, **k)
+                    return _LazyConn()
+                return connect
+            return getattr(_real_module("duckdb"), n)
+
+    class LazyPdTesting(types.ModuleType):
+        def __getattr__(self, n):
+            if n.startswith("__"):
+                raise AttributeError(n)
+
+            def f(*a, **k):
+                return getattr(_real_module("pandas.testing"), n)(*a, **k)
+            f.__name__ = n
+            return f
+
+    if "pandas" not in sys.modules and "pandas.testing" not in sys.modules:
+        sys.modules["pandas.testing"] = LazyPdTesting("pandas.testing")
+    sys.modules["duckdb"] = LazyDuck("duckdb")
+
+
 def _alarm(signum, frame):
     raise _Timeout("test timed out")
 
@@ -208,6 +296,9 @@ def _child(src, patched_files, deleted, plan, wfd, import_checks, purge=True, st
     os.chdir(src)
     if src not in sys.path:
         sys.path.insert(0, src)
+
+    if "duckdb" not in sys.modules and not any(e[0].startswith("tests/test_executor.py") for e in plan):
+        _install_lazy_heavy()
 
     # patched python modules
     mods = {}
@@ -319,12 +410,19 @@ def _run_groups(plan, emit, done_ids):
         def __init__(self):
             super().__init__()
             self.failed = set()
+            # a test ends at its first failed subtest (its verdict is settled); the run
+            # itself is never stopped this way (stop() below), only by _StopRun
+            self.failfast = True
+
+        def stop(self):
+            pass
 
         def _id(self, test):
             return getattr(test, "_br_id", None)
 
         def startTest(self, test):
             super().startTest(test)
+            STATE["in_test"] = True
             STATE["filter"] = getattr(test, "_br_filter", None)
             attr = EXEC_FILTERED.get(getattr(test, "_br_id", None))
             if attr and STATE["filter"] is not None:
