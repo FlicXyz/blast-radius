@@ -450,7 +450,7 @@ def _run_groups(plan, emit, done_ids):
                     # going on past a failure pays only if the rest passes: a second
                     # failure says the change breaks broadly, so stop then
                     if STATE["failures"] >= STATE["stop_after"] and (
-                            tid not in STATE["cont"] or (STATE["failures"] >= STATE["stop_after"] + 1
+                            tid not in STATE["cont"] or (STATE["failures"] >= STATE["stop_after"] + 2
                                                          and not (STATE["cont2"] - done_ids))):
                         raise _StopRun()
 
