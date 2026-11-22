@@ -108,6 +108,13 @@ class _StopRun(BaseException):
 STATE = {"failures": 0, "stop_after": 1, "lazy": False, "filters": {}, "filter": None, "cont": set()}
 
 
+EXEC_FILTERED = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds_sqls",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": "tpch_sqls",
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch": "tpch_sqls",
+}
+
+
 def _filter_fixtures(mod):
     """While a test with a case filter runs, its fixture loop sees only those cases."""
     orig = mod.load_sql_fixture_pairs
@@ -310,6 +317,10 @@ def _run_groups(plan, emit, done_ids):
         def startTest(self, test):
             super().startTest(test)
             STATE["filter"] = getattr(test, "_br_filter", None)
+            attr = EXEC_FILTERED.get(getattr(test, "_br_id", None))
+            if attr and STATE["filter"] is not None:
+                # TPC tests: cut the class's query list down to the selected queries
+                setattr(test, attr, [q for q in getattr(type(test), attr) if q[1] in STATE["filter"]])
             to = getattr(test, "_br_timeout", None)
             if to:
                 signal.setitimer(signal.ITIMER_REAL, to)

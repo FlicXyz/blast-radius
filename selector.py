@@ -193,6 +193,11 @@ def load_cases():
     return _cases["d"]
 
 
+EXEC_CASES = {"tests/test_executor.py::TestExecutor::test_execute_tpcds",
+              "tests/test_executor.py::TestExecutor::test_execute_tpch",
+              "tests/test_executor.py::TestExecutor::test_optimized_tpch"}
+
+
 def case_filters(res, mp, to_num):
     """num -> (SQLs of the fixture cases to run, number of cases) for candidates whose
     selection rests only on changed lines that just some of their cases execute."""
@@ -200,7 +205,7 @@ def case_filters(res, mp, to_num):
     out = {}
     for i in res.cands:
         tid = mp.tests[i]
-        if not tid.startswith("tests/test_optimizer.py::TestOptimizer::") or to_num[i] is None:
+        if not (tid.startswith("tests/test_optimizer.py::TestOptimizer::") or tid in EXEC_CASES) or to_num[i] is None:
             continue
         if cm is None:
             cm = load_cases()
@@ -321,6 +326,8 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
     eff = dict((x, ms[x]) for x in cands)
     for x, (keep, total) in filters.items():
         eff[x] = round(ms[x] * len(keep) / max(total, 1)) + 5
+        if mp_id(mp, to_num, x) in EXEC_CASES:
+            eff[x] += 1300  # the TPC tables still have to be built
     cheap = sorted((x for x in cands if eff[x] <= EXPENSIVE * 1000), key=lambda x: order(x)[:3] + (eff[x],))
     expensive = {x for x in cands if eff[x] > EXPENSIVE * 1000}
     list_cost = split.best_split([(ms[x], x) for x in cands])[0] / 1000
