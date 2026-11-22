@@ -395,9 +395,10 @@ NAME_KEYED = re.compile(r"(FUNCTIONS|KEYWORDS|PARSERS|FUNC|COMMANDS|SETTINGS|_TO
 
 
 class Analyzer:
-    def __init__(self, src_root, mp):
+    def __init__(self, src_root, mp, ops=None):
         self.src = src_root
         self.mp = mp
+        self.ops = ops
         self._scopes = {}
         self._class_index = None
 
@@ -583,6 +584,7 @@ class Analyzer:
             hunks = eff or hunks
         removed, inserted = change_points(hunks)
         new_scopes = Scopes(new_text, path)
+        loc_start = len(res.locs)
         # every difference sits inside lambda bodies: their callers are all that matter (computed lazily)
         self._lambda_only = None
         self._lambda_texts = (old_text, new_text)
@@ -597,6 +599,28 @@ class Analyzer:
                 continue
             self._locate(path, old_scopes, new_scopes, ln - 1, added, res, is_test, insert=True)
             self._locate(path, old_scopes, new_scopes, ln, added, res, is_test, insert=True)
+        if not is_test and self.ops is not None:
+            self._refine_compare(path, old_scopes.tree, new_tree, res, loc_start)
+
+    def _refine_compare(self, path, old_tree, new_tree, res, start):
+        """When the file's only change is one comparison's operator or constant operand,
+        drop the tests whose recorded operands give the same result both ways."""
+        ch = single_compare_change(old_tree, new_tree)
+        if ch is None:
+            return
+        site = f"{path}:{ch['lineno']}:{ch['col']}"
+        same = self.ops.unchanged_tests(site, ch)
+        if not same:
+            return
+        dropped = 0
+        for k in range(start, len(res.locs)):
+            why, tests = res.locs[k]
+            kept = tests - same
+            dropped += len(tests) - len(kept)
+            res.locs[k] = (why, kept)
+            res.ranged[k] = (kept, res.ranged[k][1])
+        res.cands = set().union(*(t for _, t in res.locs)) if res.locs else set()
+        res.reasons.append((f"compare {site}: {dropped} unaffected", 0))
 
     def _test_importers(self, path):
         out = set(self.mp.by_file.get(path, set()))
@@ -911,3 +935,170 @@ def _classes_referencing(tree, name):
                     out.append(n.name)
                     break
     return out
+
+
+# ---------------------------------------------------------------- comparison operands
+
+_CMP_OPS = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
+            ast.Is: "is", ast.IsNot: "is not"}
+
+
+def single_compare_change(old_tree, new_tree):
+    """If the two modules differ only in one single-operator comparison's operator and/or
+    one literal operand, describe the change; else None."""
+    olds = [n for n in ast.walk(old_tree) if isinstance(n, ast.Compare)]
+    news = [n for n in ast.walk(new_tree) if isinstance(n, ast.Compare)]
+    if len(olds) != len(news):
+        return None
+    diff = [(a, b) for a, b in zip(olds, news) if strip_dump(a) != strip_dump(b)]
+    if len(diff) != 1:
+        return None
+    a, b = diff[0]
+    if len(a.ops) != 1 or len(b.ops) != 1 or type(a.ops[0]) not in _CMP_OPS or type(b.ops[0]) not in _CMP_OPS:
+        return None
+    ch = {"lineno": a.lineno, "col": a.col_offset, "old_op": _CMP_OPS[type(a.ops[0])],
+          "new_op": _CMP_OPS[type(b.ops[0])], "left": None, "right": None}
+    for side, x, y in (("left", a.left, b.left), ("right", a.comparators[0], b.comparators[0])):
+        if strip_dump(x) == strip_dump(y):
+            continue
+        try:
+            ch[side] = ast.literal_eval(y)
+            ast.literal_eval(x)
+        except (ValueError, SyntaxError, TypeError):
+            return None
+        if not isinstance(ch[side], (int, float, str, tuple, type(None))):
+            return None
+        ch[side] = ("new", ch[side])
+    # nothing else may differ: blank out the comparison and compare the modules
+    a2, b2 = ast.Compare(left=ast.Constant(0), ops=[ast.Eq()], comparators=[ast.Constant(0)]), None
+    saved = (a.left, a.ops, a.comparators, b.left, b.ops, b.comparators)
+    try:
+        for n in (a, b):
+            n.left, n.ops, n.comparators = a2.left, a2.ops, a2.comparators
+        if strip_dump(old_tree) != strip_dump(new_tree):
+            return None
+    finally:
+        a.left, a.ops, a.comparators, b.left, b.ops, b.comparators = saved
+    return ch
+
+
+class _E:
+    """A recorded enum member."""
+
+    def __init__(self, qn, name, mix, value):
+        self.qn, self.name, self.mix, self.value = qn, name, mix, value
+
+    def key(self):
+        return (self.qn, self.name)
+
+    def __eq__(self, o):
+        if isinstance(o, _E):
+            return self.key() == o.key()
+        if self.mix == "i" and type(o) is int or self.mix == "s" and type(o) is str:
+            return self.value == o
+        return False
+
+    def __ne__(self, o):
+        return not self.__eq__(o)
+
+    def _ord(self, o):
+        if isinstance(o, _E) and o.qn == self.qn and self.mix == "i":
+            return o.value
+        if self.mix == "i" and type(o) is int:
+            return o
+        raise TypeError
+
+    def __lt__(self, o): return self.value < self._ord(o)
+    def __le__(self, o): return self.value <= self._ord(o)
+    def __gt__(self, o): return self.value > self._ord(o)
+    def __ge__(self, o): return self.value >= self._ord(o)
+    __hash__ = None
+
+
+class _Unknown(Exception):
+    pass
+
+
+def _dec(x):
+    if x is None or isinstance(x, bool):
+        return x
+    tag = x[0]
+    if tag == "f" and isinstance(x[1], list):
+        return frozenset(_dec(i) for i in x[1])
+    if tag in ("i", "f", "s"):
+        return x[1]
+    if tag == "t":
+        return tuple(_dec(i) for i in x[1])
+    if tag == "z":
+        return frozenset(_dec(i) for i in x[1])
+    if tag == "e":
+        return _E(x[1], x[2], x[3], x[4])
+    if tag == "c":
+        return ("<class>", x[1])
+    if tag == "o":
+        return ("<object>",)
+    raise _Unknown
+
+
+def _apply(op, a, b):
+    if op in ("is", "is not"):
+        if a is None or b is None:
+            r = a is None and b is None
+        elif isinstance(a, _E) and isinstance(b, _E):
+            r = a.key() == b.key()
+        elif isinstance(a, tuple) and isinstance(b, tuple) and a[:1] == ("<class>",) and b[:1] == ("<class>",):
+            r = a == b
+        else:
+            raise _Unknown
+        return r if op == "is" else not r
+    if any(isinstance(v, tuple) and v[:1] in (("<class>",), ("<object>",)) for v in (a, b)):
+        # classes compare by identity unless their metaclass says otherwise (recorded as plain)
+        if op in ("==", "!=") and all(isinstance(v, tuple) and v[:1] == ("<class>",) for v in (a, b)):
+            return (a == b) if op == "==" else (a != b)
+        raise _Unknown
+    import operator
+    fn = {"==": operator.eq, "!=": operator.ne, "<": operator.lt, "<=": operator.le,
+          ">": operator.gt, ">=": operator.ge}[op]
+    try:
+        return bool(fn(a, b))
+    except TypeError:
+        raise _Unknown
+
+
+class OpsMap:
+    def __init__(self, path, tests):
+        with gzip.open(path, "rt") as fh:
+            d = json.load(fh)
+        self.idx = {t: i for i, t in enumerate(tests)}
+        self.tests = d["tests"]          # their test ids
+        self.sets = d["sets"]            # pair-set id -> list of [a, b] pairs
+        self.sites = d["sites"]          # site -> {pair-set id or "u": [test numbers in d["tests"]]}
+
+    def unchanged_tests(self, site, ch):
+        """Map indices of tests whose every recorded evaluation of the comparison at
+        site gives the same result after the change."""
+        groups = self.sites.get(site)
+        if not groups:
+            return set()
+        out = set()
+        for ps, tl in groups.items():
+            if ps == "u":
+                continue
+            try:
+                for a, b in self.sets[int(ps)]:
+                    a, b = _dec(a), _dec(b)
+                    na = _dec_new(ch["left"]) if ch["left"] is not None else a
+                    nb = _dec_new(ch["right"]) if ch["right"] is not None else b
+                    if _apply(ch["old_op"], a, b) != _apply(ch["new_op"], na, nb):
+                        raise _Unknown
+            except _Unknown:
+                continue
+            for t in tl:
+                i = self.idx.get(self.tests[t])
+                if i is not None:
+                    out.add(i)
+        return out
+
+
+def _dec_new(v):
+    return v[1]

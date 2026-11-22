@@ -28,6 +28,7 @@ DATA = os.environ.get("BR_DATA", "/data")
 SRC = os.environ.get("BR_SRC", "/app/sqlglot")
 MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.json.gz"))
 CASES = os.environ.get("BR_CASES", os.path.join(HERE, "cases.json.gz"))
+OPS = os.environ.get("BR_OPS", os.path.join(HERE, "ops.json.gz"))
 TMP = os.environ.get("BR_TMP", "/tmp/br")
 
 DEBUG = os.environ.get("BR_DEBUG")
@@ -97,7 +98,7 @@ def _main():
     deadline = t0 + max(20.0, min(5.0 * n, 0.8 * 6.0 * n))
 
     mp = analyze.Map(MAP)
-    an = analyze.Analyzer(SRC, mp)
+    an = analyze.Analyzer(SRC, mp, LazyOps(mp))
     to_num = [by_id[t]["number"] if t in by_id else None for t in mp.tests]
     known = {by_id[t]["number"] for t in mp.tests if t in by_id}
     unknown_tests = [t["number"] for t in tj if t["number"] not in known]
@@ -159,6 +160,24 @@ _heavy_cache = {}
 
 LAZY_DEPS = ("sqlglot/executor/table.py", "tests/helpers.py", "tests/test_executor.py",
              "tests/fixtures/optimizer/tpc-h/", "tests/fixtures/optimizer/tpc-ds/")
+
+
+class LazyOps:
+    """Loads the comparison-operand map on first use (only patches that change a
+    single comparison need it)."""
+
+    def __init__(self, mp):
+        self.mp = mp
+        self.m = None
+
+    def unchanged_tests(self, site, ch):
+        if self.m is None:
+            try:
+                self.m = analyze.OpsMap(OPS, self.mp.tests)
+            except (OSError, ValueError) as e:
+                log(f"ops map unavailable: {e!r}")
+                self.m = False
+        return self.m.unchanged_tests(site, ch) if self.m else set()
 
 
 _cases = {}
