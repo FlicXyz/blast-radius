@@ -185,6 +185,9 @@ class LazyOps:
     def unchanged_tests(self, site, ch):
         return self._load().unchanged_tests(site, ch) if self._load() else set()
 
+    def changed_tests(self, site, ch):
+        return self._load().changed_tests(site, ch) if self._load() else set()
+
     def dict_unaffected(self, path, chs):
         return self._load().dict_unaffected(path, chs) if self._load() else set()
 
@@ -326,11 +329,12 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
             if to_num[i] is not None:
                 hits[to_num[i]] = hits.get(to_num[i], 0) + 1
     stems = {os.path.basename(f).rsplit(".", 1)[0] for f in res.files_changed if f}
+    likely = {to_num[i] for i in getattr(res, "likely", ()) if to_num[i] is not None}
     def order(x):
         tid = mp_id(mp, to_num, x)
         tf = os.path.basename(tid.split("::")[0])[5:-3]
         setup = setup_cost("::".join(tid.split("::")[:2]), p)
-        return (setup > 0.5, -(tf in stems), -hits.get(x, 0), ms[x])
+        return (setup > 0.5, -(x in likely), -(tf in stems), -hits.get(x, 0), ms[x])
     # fixture-driven tests whose changed lines only some fixture cases reach run just those
     filters = case_filters(res, mp, to_num)
     p["filters"] = filters
@@ -339,7 +343,7 @@ def plan_commit(cid, text, an, mp, to_num, ms, unknown_tests):
         eff[x] = round(ms[x] * len(keep) / max(total, 1)) + 5
         if mp_id(mp, to_num, x) in EXEC_CASES:
             eff[x] += 1300  # the TPC tables still have to be built
-    cheap = sorted((x for x in cands if eff[x] <= EXPENSIVE * 1000), key=lambda x: order(x)[:3] + (eff[x],))
+    cheap = sorted((x for x in cands if eff[x] <= EXPENSIVE * 1000), key=lambda x: order(x)[:4] + (eff[x],))
     expensive = {x for x in cands if eff[x] > EXPENSIVE * 1000}
     list_cost = split.best_split([(ms[x], x) for x in cands])[0] / 1000
     run_cost = sum(eff[x] for x in cheap) / 1000 + 0.2 + sum(

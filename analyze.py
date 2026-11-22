@@ -437,6 +437,7 @@ class Result:
         self.import_fail_tests = {} # module -> tests that fail if it doesn't import
         self.everything = False
         self.files_changed = []
+        self.likely = set()         # tests whose recorded values show the change (run them first)
 
     def add(self, tests, why, ranges=None):
         tests = set(tests)
@@ -717,6 +718,10 @@ class Analyzer:
             return
         site = f"{path}:{ch['lineno']}:{ch['col']}"
         same = self.ops.unchanged_tests(site, ch)
+        try:
+            res.likely |= self.ops.changed_tests(site, ch)
+        except Exception:  # noqa
+            pass
         if not same:
             return
         dropped = 0
@@ -1399,6 +1404,35 @@ def _dict_unaffected(self, path, chs):
 
 
 OpsMap.dict_unaffected = _dict_unaffected
+
+
+def _changed_tests(self, site, ch):
+    """Map indices of tests that recorded operands giving another result after the change."""
+    groups, sets = self._site(site)
+    out = set()
+    for ps, tl in (groups or {}).items():
+        if ps == "u":
+            continue
+        hit = False
+        for a, b in sets[int(ps)]:
+            try:
+                a, b = _dec(a), _dec(b)
+                na = _dec_new(ch["left"]) if ch["left"] is not None else a
+                nb = _dec_new(ch["right"]) if ch["right"] is not None else b
+                if _apply(ch["old_op"], a, b) != _apply(ch["new_op"], na, nb):
+                    hit = True
+                    break
+            except _Unknown:
+                continue
+        if hit:
+            for t in tl:
+                i = self.idx.get(self.tests[t])
+                if i is not None:
+                    out.add(i)
+    return out
+
+
+OpsMap.changed_tests = _changed_tests
 
 
 def _dec_new(v):

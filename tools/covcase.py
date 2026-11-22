@@ -95,13 +95,20 @@ for tid in ids:
         def pairs(filename):
             for i, (meta, sql, expected) in enumerate(orig_pairs(filename), start=1):
                 titles[meta.get("title") or f"{i}, {sql}"] = sql
+                fixture_sqls.add(sql)
                 yield meta, sql, expected
 
         mod.load_sql_fixture_pairs = pairs
         orig_pao = mod.parse_and_optimize
 
+        fixture_sqls = set()
+
         def pao(func, sql, *a, **k):
             prev = state["cur"]
+            if sql not in fixture_sqls:
+                # built from a case's SQL (e.g. "SELECT {sql} FROM tbl"): stays with the
+                # current subtest's case
+                return orig_pao(func, sql, *a, **k)
             switch(cases.setdefault(sql, set()))
             try:
                 return orig_pao(func, sql, *a, **k)
