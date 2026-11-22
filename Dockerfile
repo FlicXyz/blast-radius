@@ -19,9 +19,6 @@ tarfile.open(fileobj=io.BytesIO(data)).extractall('/app', filter='data')" \
 COPY selector.py analyze.py runner.py split.py map.json.gz cases.json.gz /app/
 COPY ops /app/ops
 RUN python -m compileall -q /app/*.py \
- && python -c "import gzip, json, marshal; d = json.load(gzip.open('/app/map.json.gz', 'rt')); \
-d['lines'] = {f: {int(k): v for k, v in m.items()} for f, m in d['lines'].items()}; \
-marshal.dump(d, open('/app/map.marshal', 'wb'))" \
  && chmod -R a+rX /app
 
 WORKDIR /app
