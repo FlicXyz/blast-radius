@@ -28,7 +28,7 @@ DATA = os.environ.get("BR_DATA", "/data")
 SRC = os.environ.get("BR_SRC", "/app/sqlglot")
 MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.json.gz"))
 CASES = os.environ.get("BR_CASES", os.path.join(HERE, "cases.json.gz"))
-OPS = os.environ.get("BR_OPS", os.path.join(HERE, "ops.json.gz"))
+OPS = os.environ.get("BR_OPS", os.path.join(HERE, "ops"))
 TMP = os.environ.get("BR_TMP", "/tmp/br")
 
 DEBUG = os.environ.get("BR_DEBUG")

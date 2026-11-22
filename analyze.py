@@ -1067,17 +1067,27 @@ def _apply(op, a, b):
 
 class OpsMap:
     def __init__(self, path, tests):
-        with gzip.open(path, "rt") as fh:
-            d = json.load(fh)
+        self.dir = path
+        with gzip.open(os.path.join(path, "tests.json.gz"), "rt") as fh:
+            self.tests = json.load(fh)   # their test ids
         self.idx = {t: i for i, t in enumerate(tests)}
-        self.tests = d["tests"]          # their test ids
-        self.sets = d["sets"]            # pair-set id -> list of [a, b] pairs
-        self.sites = d["sites"]          # site -> {pair-set id or "u": [test numbers in d["tests"]]}
+        self.files = {}
+
+    def _site(self, site):
+        src = site.rsplit(":", 2)[0]
+        if src not in self.files:
+            try:
+                with gzip.open(os.path.join(self.dir, src.replace("/", "__") + ".json.gz"), "rt") as fh:
+                    self.files[src] = json.load(fh)
+            except OSError:
+                self.files[src] = {"sets": [], "sites": {}}
+        d = self.files[src]
+        return d["sites"].get(site), d["sets"]
 
     def unchanged_tests(self, site, ch):
         """Map indices of tests whose every recorded evaluation of the comparison at
         site gives the same result after the change."""
-        groups = self.sites.get(site)
+        groups, sets = self._site(site)
         if not groups:
             return set()
         out = set()
@@ -1085,7 +1095,7 @@ class OpsMap:
             if ps == "u":
                 continue
             try:
-                for a, b in self.sets[int(ps)]:
+                for a, b in sets[int(ps)]:
                     a, b = _dec(a), _dec(b)
                     na = _dec_new(ch["left"]) if ch["left"] is not None else a
                     nb = _dec_new(ch["right"]) if ch["right"] is not None else b
