@@ -93,8 +93,14 @@ for tid in ids:
         orig_pairs = mod.load_sql_fixture_pairs
 
         def pairs(filename):
-            for i, (meta, sql, expected) in enumerate(orig_pairs(filename), start=1):
-                titles[meta.get("title") or f"{i}, {sql}"] = sql
+            items = list(enumerate(orig_pairs(filename), start=1))
+            if os.environ.get("BR_REVERSE"):
+                # the cases in the opposite order: a line that only the first case to need
+                # some cached state runs shows up under different cases
+                items.reverse()
+            for pos, (i, (meta, sql, expected)) in enumerate(items, start=1):
+                # tests number the cases as they receive them
+                titles[meta.get("title") or f"{pos}, {sql}"] = sql
                 fixture_sqls.add(sql)
                 yield meta, sql, expected
 
