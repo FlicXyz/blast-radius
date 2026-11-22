@@ -38,7 +38,7 @@ PARALLEL = 2
 # With slow candidates in play, keep running after a failure: changes that break
 # the slow tests break many cheap ones too, so a handful of failures decides it.
 STOP_AFTER_EXP = 1
-CPU_FACTOR = 1.5     # assumed board CPU seconds per recorded test second
+CPU_FACTOR = 2.2     # assumed board CPU seconds per recorded test second
 # CPU seconds of class-level fixtures (setUpClass) at the pinned commit; the
 # recorded per-test seconds don't include them.
 SETUP_COST = {"tests/test_executor.py::TestExecutor": 1.3}
